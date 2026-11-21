@@ -112,9 +112,9 @@ impl QuantizationResult {
 
             // remapping above was the last chance to do K-Means iteration, hence the final palette is set after remapping
             palette.init_int_palette(&mut remapped.int_palette, self.gamma, self.min_posterization_output);
-            remapped.palette_error = palette_error;
             let max_dither_error = (palette_error.unwrap_or(quality_to_mse(80)) * 2.4).max(quality_to_mse(35)) as f32;
-            remap_to_palette_floyd(image, output_pixels, &palette, self, max_dither_error, output_image_is_remapped)?;
+            // the error of the actual dithered output, measured on the final index bitmap
+            remapped.palette_error = Some(remap_to_palette_floyd(image, output_pixels, &palette, self, max_dither_error, output_image_is_remapped)?);
         }
         self.remapped = Some(remapped);
         Ok(())
@@ -178,7 +178,17 @@ impl QuantizationResult {
         self.palette_error.map(internal_mse_to_standard_mse)
     }
 
-    /// Approximate mean square error of the palette used for the most recent remapping
+    /// Mean square error of the most recent remapping, measured per-pixel between the original
+    /// image and the actual remapped output (the final palette applied to the output indexes,
+    /// including the effect of dithering).
+    ///
+    /// If the image has a background set, pixels remapped to a transparent palette entry
+    /// (which display the background) are compared against the background pixel they show.
+    /// The importance map is not taken into account: this is the plain error of the final
+    /// output, on the same scale as [`quantization_error()`][Self::quantization_error].
+    ///
+    /// If the image hasn't been remapped yet, it's the palette's approximate error,
+    /// same as [`quantization_error()`][Self::quantization_error].
     #[must_use]
     pub fn remapping_error(&self) -> Option<f64> {
         self.remapped.as_ref()
@@ -188,6 +198,9 @@ impl QuantizationResult {
     }
 
     /// Palette remapping error mapped back to 0-100 scale, same as the scale in [`Attributes::set_quality()`]
+    ///
+    /// It's the quality of the most recent remapped output, see [`remapping_error()`][Self::remapping_error]
+    /// for how it's measured.
     #[must_use]
     pub fn remapping_quality(&self) -> Option<u8> {
         self.remapped.as_ref()

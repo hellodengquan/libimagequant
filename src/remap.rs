@@ -5,7 +5,7 @@ use crate::nearest::Nearest;
 use crate::pal::{f_pixel, PalF, PalIndexRemap, Palette, ARGBF};
 use crate::quant::QuantizationResult;
 use crate::rayoff::*;
-use crate::rows::{temp_buf, DynamicRows};
+use crate::rows::{temp_buf, DynamicRows, DynamicRowsIter};
 use crate::seacow::{RowBitmap, RowBitmapMut};
 use crate::CacheLineAlign;
 use core::cell::RefCell;
@@ -25,6 +25,8 @@ pub enum DitherMapMode {
 #[derive(Clone)]
 pub(crate) struct Remapped {
     pub(crate) int_palette: Palette,
+    /// Mean square error of the most recent remapping, measured on the actual output
+    /// (the final palette applied to the output indexes), not a palette-generation estimate
     pub(crate) palette_error: Option<f64>,
 }
 
@@ -39,6 +41,7 @@ pub(crate) fn remap_to_palette<'x, 'b: 'x>(px: &mut DynamicRows, background: Opt
 
     let tls = ThreadLocal::new();
     let width = px.width as usize;
+    let height = px.height as usize;
     let per_thread_buffers = move || -> Result<_, Error> { Ok(CacheLineAlign(RefCell::new((Kmeans::new(palette_len)?, temp_buf(width)?, temp_buf(width)?, temp_buf(width)?)))) };
 
     let tls_tmp1 = tls.get_or_try(per_thread_buffers)?;
@@ -58,10 +61,9 @@ pub(crate) fn remap_to_palette<'x, 'b: 'x>(px: &mut DynamicRows, background: Opt
 
     drop(tls_tmp);
 
-    let remapping_error = output_pixels.rows_mut().enumerate().par_bridge().map(|(row, output_pixels_row)| {
-        let mut remapping_error = 0.;
+    let rows_remapped = output_pixels.rows_mut().enumerate().par_bridge().map(|(row, output_pixels_row)| {
         #[allow(irrefutable_let_patterns)]
-        let Ok(tls_res) = tls.get_or_try(per_thread_buffers) else { return f64::NAN };
+        let Ok(tls_res) = tls.get_or_try(per_thread_buffers) else { return 0 };
         let (kmeans, temp_row, temp_row_f, temp_row_f_bg) = &mut *tls_res.0.borrow_mut();
 
         let output_pixels_row = &mut output_pixels_row[..width];
@@ -77,23 +79,20 @@ pub(crate) fn remap_to_palette<'x, 'b: 'x>(px: &mut DynamicRows, background: Opt
             let matched = matched as PalIndexRemap;
             last_match = matched;
             if let Some(bg) = bg_pixels.get(col) {
-                let bg_diff = bg.diff(inp);
-                if bg_diff <= diff {
-                    remapping_error += f64::from(bg_diff);
+                if bg.diff(inp) <= diff {
                     out.write(transparent_index);
                     continue;
                 }
             }
-            remapping_error += f64::from(diff);
             out.write(matched);
             let importance = f32::from(importance_map.get(col).copied().unwrap_or(1));
             kmeans.update_color(*inp, importance, matched as _);
         }
-        remapping_error
+        1
     })
-    .sum::<f64>();
+    .sum::<usize>();
 
-    if remapping_error.is_nan() {
+    if rows_remapped != height {
         return Err(Error::OutOfMemory);
     }
 
@@ -101,8 +100,85 @@ pub(crate) fn remap_to_palette<'x, 'b: 'x>(px: &mut DynamicRows, background: Opt
         .map(|t| t.0.into_inner().0)
         .reduce(Kmeans::merge) { kmeans.finalize(palette); }
 
-    let remapping_error = remapping_error / f64::from(px.width * px.height);
+    // The reported error must describe the actual output: the final palette
+    // (after the k-means iteration above) applied to the written indexes
+    let remapping_error = measure_remapping_error(
+        &input_rows,
+        background.as_ref(),
+        &unsafe { output_pixels.assume_init() },
+        palette.as_slice(),
+        width,
+        height,
+    )?;
     Ok((remapping_error, unsafe { output_pixels.assume_init() }))
+}
+
+/// Mean square error of the actual remapped output, computed per-pixel between the original
+/// image and the final output image (i.e. `palette[output_index]` for each pixel).
+///
+/// When a background is set, pixels written as a fully-transparent palette entry are
+/// displayed as the background, so the background pixel is used as their output color.
+///
+/// The importance map is deliberately not applied here, so that the result is the plain
+/// error of the final output, on the same scale as the quantization error.
+///
+/// The result is deterministic: per-row errors are stored by row index and summed
+/// sequentially, so the number of threads or chunks doesn't affect it.
+fn measure_remapping_error(
+    input_rows: &DynamicRowsIter<'_, '_, '_>,
+    background_rows: Option<&DynamicRowsIter<'_, '_, '_>>,
+    output_pixels: &RowBitmap<'_, PalIndexRemap>,
+    palette: &[f_pixel],
+    width: usize,
+    height: usize,
+) -> Result<f64, Error> {
+    let tls = ThreadLocal::new();
+    let per_thread_buffers = move || -> Result<_, Error> { Ok(CacheLineAlign(RefCell::new((temp_buf(width)?, temp_buf(width)?, temp_buf(width)?)))) };
+    tls.get_or_try(per_thread_buffers)?;
+
+    let mut output_rows = Vec::new();
+    output_rows.try_reserve_exact(height)?;
+    output_rows.extend(output_pixels.rows());
+
+    let mut row_errors = Vec::new();
+    row_errors.try_reserve_exact(height)?;
+    row_errors.resize(height, 0f64);
+
+    let chunk_size = (height / (num_cpus() * 8).max(1)).max(1);
+    row_errors.as_mut_slice().par_chunks_mut(chunk_size).enumerate().for_each(|(chunk_idx, chunk_errors)| {
+        let start_row = chunk_idx * chunk_size;
+        #[allow(irrefutable_let_patterns)]
+        let Ok(tls_res) = tls.get_or_try(per_thread_buffers) else {
+            chunk_errors.fill(f64::NAN);
+            return;
+        };
+        let (temp_row, temp_row_f, temp_row_f_bg) = &mut *tls_res.0.borrow_mut();
+        for (i, row_error) in chunk_errors.iter_mut().enumerate() {
+            let row = start_row + i;
+            let row_pixels = &input_rows.row_f_shared(temp_row, temp_row_f, row)[..width];
+            let bg_pixels = if let Some(background_rows) = background_rows {
+                &background_rows.row_f_shared(temp_row, temp_row_f_bg, row)[..width]
+            } else { &[] };
+            let mut error = 0.;
+            for (col, (&inp, &out)) in row_pixels.iter().zip(output_rows[row]).enumerate() {
+                let out = usize::from(out);
+                // a fully-transparent output index shows the background pixel instead of the palette color
+                let output_color = if let Some(bg) = bg_pixels.get(col).filter(|_| palette[out].is_fully_transparent()) {
+                    bg
+                } else {
+                    &palette[out]
+                };
+                error += f64::from(inp.diff(output_color));
+            }
+            *row_error = error;
+        }
+    });
+
+    if row_errors.iter().any(|e| e.is_nan()) {
+        return Err(Error::OutOfMemory);
+    }
+    let total_error = row_errors.iter().sum::<f64>();
+    Ok(total_error / (width * height) as f64)
 }
 
 fn get_dithered_pixel(dither_level: f32, max_dither_error: f32, thiserr: f_pixel, px: f_pixel) -> f_pixel {
@@ -147,8 +223,10 @@ fn get_dithered_pixel(dither_level: f32, max_dither_error: f32, thiserr: f_pixel
 /// Uses edge/noise map to apply dithering only to flat areas. Dithering on edges creates jagged lines, and noisy areas are "naturally" dithered.
 ///
 ///  If `output_image_is_remapped` is true, only pixels noticeably changed by error diffusion will be written to output image.
+///
+/// Returns the mean square error of the actual dithered output (see [`measure_remapping_error`]).
 #[inline(never)]
-pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels: RowBitmapMut<'_, MaybeUninit<PalIndexRemap>>, palette: &PalF, quant: &QuantizationResult, max_dither_error: f32, output_image_is_remapped: bool) -> Result<(), Error> {
+pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels: RowBitmapMut<'_, MaybeUninit<PalIndexRemap>>, palette: &PalF, quant: &QuantizationResult, max_dither_error: f32, output_image_is_remapped: bool) -> Result<f64, Error> {
     let progress_stage1 = if quant.use_dither_map != DitherMapMode::None { 20 } else { 0 };
 
     let width = input_image.width();
@@ -232,7 +310,19 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
             chunk_start_row += chunk_len;
         }
         Ok(())
-    })
+    })?;
+
+    // The reported error must describe the actual dithered output written above
+    let input_rows = input_image_px.rows_iter_prepared()?;
+    let background_rows = background.map(|bg| bg.rows_iter_prepared()).transpose()?;
+    measure_remapping_error(
+        &input_rows,
+        background_rows.as_ref(),
+        &unsafe { output_pixels.assume_init() },
+        palette,
+        width,
+        height,
+    )
 }
 
 #[inline(never)]
@@ -345,9 +435,76 @@ fn background_to_nop() {
     let (_, idx) = res.remapped(&mut img).unwrap();
     let first = idx[0];
     assert!(idx.iter().all(|&x| x == first));
+    // every pixel is displayed as the (identical) background, so the actual output error is 0
+    assert_eq!(res.remapping_error(), Some(0.));
+    assert_eq!(res.remapping_quality(), Some(100));
 
     res.set_dithering_level(1.).unwrap();
     let (_, idx) = res.remapped(&mut img).unwrap();
     let first = idx[0];
     assert!(idx.iter().all(|&x| x == first));
+    // dithered output is entirely the background too, so the error must be 0 as well,
+    // not the palette's approximation error
+    assert_eq!(res.remapping_error(), Some(0.));
+    assert_eq!(res.remapping_quality(), Some(100));
+}
+
+#[test]
+fn measured_remapping_error_matches_output() {
+    use crate::pal::{gamma_lut, PalF, PalPop};
+    use crate::rows::PixelsSource;
+    use crate::seacow::SeaCow;
+    use crate::RGBA;
+
+    let (width, height) = (17usize, 13usize);
+    let gamma = 0.45455;
+    let lut = gamma_lut(gamma);
+    let px = |n: usize| RGBA::new((n * 3) as u8, (n * 5) as u8, (n * 7) as u8, 255);
+    let pixels: Vec<RGBA> = (0..width * height).map(px).collect();
+    let bg_pixels: Vec<RGBA> = (0..width * height).map(|n| RGBA::new(255, (n * 11) as u8, 0, 255)).collect();
+
+    // palette: transparent, black, white (in internal gamma, like the remapper sees it)
+    let mut palette = PalF::new();
+    palette.push(f_pixel::default(), PalPop::new(1.));
+    palette.push(f_pixel::from_rgba(&lut, RGBA::new(0, 0, 0, 255)), PalPop::new(1.));
+    palette.push(f_pixel::from_rgba(&lut, RGBA::new(255, 255, 255, 255)), PalPop::new(1.));
+    let palette = palette.as_slice().to_vec();
+
+    // mix of opaque and transparent (background) output indexes
+    let indexes: Vec<PalIndexRemap> = (0..width * height).map(|n| [1, 2, 0][n % 3]).collect();
+
+    let expected = {
+        let total: f64 = pixels.iter().zip(&bg_pixels).zip(&indexes).map(|((&inp, &bg), &idx)| {
+            let inp = f_pixel::from_rgba(&lut, inp);
+            let out = if idx == 0 { f_pixel::from_rgba(&lut, bg) } else { palette[usize::from(idx)] };
+            f64::from(inp.diff(&out))
+        }).sum();
+        total / (width * height) as f64
+    };
+
+    let mut image_rows = DynamicRows::new(width as u32, height as u32, PixelsSource::for_pixels(SeaCow::boxed(pixels.into_boxed_slice()), width as u32, height as u32, width as u32).unwrap(), gamma);
+    let mut bg_rows = DynamicRows::new(width as u32, height as u32, PixelsSource::for_pixels(SeaCow::boxed(bg_pixels.into_boxed_slice()), width as u32, height as u32, width as u32).unwrap(), gamma);
+    let mut temp_row = temp_buf(width).unwrap();
+    let input_iter = image_rows.rows_iter(&mut temp_row).unwrap();
+    let bg_iter = bg_rows.rows_iter(&mut temp_row).unwrap();
+
+    let mut out_buf: Vec<MaybeUninit<PalIndexRemap>> = indexes.iter().map(|&i| MaybeUninit::new(i)).collect();
+    let mut out_rows = RowBitmapMut::new_contiguous(&mut out_buf, width);
+    let out_rows = unsafe { out_rows.assume_init() };
+
+    // without a background, transparent indexes are compared against the palette
+    let no_bg = measure_remapping_error(&input_iter, None, &out_rows, &palette, width, height).unwrap();
+    let expected_no_bg = {
+        let total: f64 = (0..width * height).map(|n| {
+            let inp = f_pixel::from_rgba(&lut, px(n));
+            f64::from(inp.diff(&palette[usize::from(indexes[n])]))
+        }).sum();
+        total / (width * height) as f64
+    };
+    assert!((no_bg - expected_no_bg).abs() < 1e-6, "{no_bg} != {expected_no_bg}");
+
+    // with a background, transparent indexes are compared against the background pixel
+    let with_bg = measure_remapping_error(&input_iter, Some(&bg_iter), &out_rows, &palette, width, height).unwrap();
+    assert!((with_bg - expected).abs() < 1e-6, "{with_bg} != {expected}");
+    assert!(with_bg < no_bg);
 }

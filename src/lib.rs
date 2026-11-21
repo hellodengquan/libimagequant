@@ -48,7 +48,7 @@ mod rayoff;
 mod rayoff {
     pub(crate) fn num_cpus() -> usize { std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) }
     pub(crate) use rayon::in_place_scope as scope;
-    pub(crate) use rayon::prelude::{ParallelBridge, ParallelIterator, ParallelSliceMut};
+    pub(crate) use rayon::prelude::{IndexedParallelIterator, ParallelBridge, ParallelIterator, ParallelSliceMut};
     pub(crate) use thread_local::ThreadLocal;
 }
 
@@ -90,6 +90,53 @@ fn copy_img() {
     let tmp = vec![RGBA::new(1, 2, 3, 4); 10 * 100];
     let liq = Attributes::new();
     let _ = liq.new_image_stride(tmp, 10, 100, 10, 0.).unwrap();
+}
+
+#[test]
+fn remapping_error_reflects_actual_output() {
+    use crate::pal::{f_pixel, gamma_lut, internal_mse_to_standard_mse};
+
+    let (w, h) = (160, 160);
+    let pixels: Vec<RGBA> = (0..w * h).map(|n| {
+        let (x, y) = (n % w, n / w);
+        RGBA::new((x * 3 / 2) as u8, (y * 3 / 2) as u8, ((x + 2 * y) / 2) as u8, 255)
+    }).collect();
+    let lut = gamma_lut(0.45455);
+    // MSE of the actual output (palette applied to the output indexes), measured independently
+    let actual_output_error = |palette: &[RGBA], indexes: &[u8]| {
+        let mse = pixels.iter().zip(indexes).map(|(&px, &i)| {
+            let inp = f_pixel::from_rgba(&lut, px);
+            let out = f_pixel::from_rgba(&lut, palette[usize::from(i)]);
+            f64::from(inp.diff(&out))
+        }).sum::<f64>() / (w * h) as f64;
+        internal_mse_to_standard_mse(mse)
+    };
+
+    for dither_level in [0., 0.5, 1.] {
+        for single_threaded in [false, true] {
+            let mut liq = new();
+            liq.set_max_colors(8).unwrap();
+            liq.single_threaded_dithering = single_threaded;
+            let img = &mut liq.new_image_borrowed(&pixels, w, h, 0.).unwrap();
+            let mut res = liq.quantize(img).unwrap();
+            // not remapped yet: falls back to the palette approximation
+            assert_eq!(res.remapping_error(), res.quantization_error());
+
+            res.set_dithering_level(dither_level).unwrap();
+            let (palette, indexes) = res.remapped(img).unwrap();
+            let reported = res.remapping_error().unwrap();
+            let expected = actual_output_error(&palette, &indexes);
+            let rel_diff = (reported - expected).abs() / expected.max(1e-9);
+            assert!(rel_diff < 0.05, "dither={dither_level} single_threaded={single_threaded}: reported {reported}, expected {expected}");
+
+            // the error always describes the most recent remapping
+            let (palette, indexes) = res.remapped(img).unwrap();
+            let reported = res.remapping_error().unwrap();
+            let expected = actual_output_error(&palette, &indexes);
+            let rel_diff = (reported - expected).abs() / expected.max(1e-9);
+            assert!(rel_diff < 0.05, "second remap: dither={dither_level} single_threaded={single_threaded}: reported {reported}, expected {expected}");
+        }
+    }
 }
 
 #[test]
