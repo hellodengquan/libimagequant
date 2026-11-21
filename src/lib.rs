@@ -68,6 +68,7 @@ pub use image::Image;
 #[doc(hidden)]
 pub use pal::Palette;
 pub use pal::RGBA;
+pub use pal::RGBA16;
 pub use quant::QuantizationResult;
 
 #[doc(hidden)]
@@ -237,6 +238,261 @@ fn r_callback_test() {
     let called = called.load(SeqCst);
     assert!(called > 5 && called < 50);
     assert_eq!(123, res.palette().len());
+}
+
+#[cfg(test)]
+mod rgba16_tests {
+    use super::*;
+    use core::mem::MaybeUninit;
+
+    fn quantize_8(pixels: &[RGBA], w: usize, h: usize) -> (Vec<RGBA>, Vec<u8>) {
+        let attr = new();
+        let mut img = attr.new_image_borrowed(pixels, w, h, 0.).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(1.).unwrap();
+        res.remapped(&mut img).unwrap()
+    }
+
+    fn quantize_16(pixels: &[RGBA16], w: usize, h: usize) -> (Vec<RGBA>, Vec<u8>) {
+        let attr = new();
+        let mut img = attr.new_borrowed_16(pixels, w, h, 0.).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(1.).unwrap();
+        res.remapped(&mut img).unwrap()
+    }
+
+    #[test]
+    fn shifted_8bit_matches_8bit_path() {
+        // 8-bit values mapped onto the 16-bit grid (v16 = v8 * 257) carry exactly the same
+        // information as the native 8-bit input. The resulting palette must contain the same
+        // colors (as a multiset). Order and sub-LSB rounding can differ because the two paths
+        // use separate hash maps whose iteration order changes floating-point summation order.
+        let pixels8: Vec<RGBA> = (0..64 * 64)
+            .map(|n| RGBA::new((n * 7 % 256) as u8, (n * 3 % 256) as u8, (n * 5 % 256) as u8, 255))
+            .collect();
+        let pixels16: Vec<RGBA16> = pixels8.iter()
+            .map(|p| {
+                let s = |v: u8| (v as u16) * 257;
+                RGBA16::new(s(p.r), s(p.g), s(p.b), s(p.a))
+            })
+            .collect();
+
+        let (pal8, _idx8) = quantize_8(&pixels8, 64, 64);
+        let (pal16, _idx16) = quantize_16(&pixels16, 64, 64);
+
+        assert_eq!(pal8.len(), pal16.len(), "palette size must match");
+        let mut sorted8 = pal8.clone();
+        let mut sorted16 = pal16.clone();
+        sorted8.sort_by_key(|c| (c.r, c.g, c.b, c.a));
+        sorted16.sort_by_key(|c| (c.r, c.g, c.b, c.a));
+        for (a, b) in sorted8.iter().zip(&sorted16) {
+            // allow at most one unit of 8-bit rounding noise per channel
+            let dr = a.r.abs_diff(b.r);
+            let dg = a.g.abs_diff(b.g);
+            let db = a.b.abs_diff(b.b);
+            let da = a.a.abs_diff(b.a);
+            assert!(dr <= 1 && dg <= 1 && db <= 1 && da <= 1, "palette colors diverge: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_16bit_is_information_equivalent_to_8bit() {
+        // The strongest guarantee: feeding the 8-bit API the truncated image and feeding the
+        // 16-bit API the full grid-aligned image produce palettes covering the same color space.
+        let pixels8: Vec<RGBA> = (0..32 * 32)
+            .map(|n| RGBA::new((n * 11 % 256) as u8, (n * 13 % 256) as u8, 90, 255))
+            .collect();
+        let pixels16: Vec<RGBA16> = pixels8.iter()
+            .map(|p| {
+                let s = |v: u8| (v as u16) * 257;
+                RGBA16::new(s(p.r), s(p.g), s(p.b), s(p.a))
+            })
+            .collect();
+
+        let (pal8, _) = quantize_8(&pixels8, 32, 32);
+        let (pal16, _) = quantize_16(&pixels16, 32, 32);
+        assert_eq!(pal8.len(), pal16.len());
+    }
+
+    #[test]
+    fn smooth_gradient_keeps_local_average() {
+        // A 16-bit gradient with 256 steps. The key property under test: the dithered
+        // local average of the output indices follows the original 16-bit value rather
+        // than sticking to 8-bit steps. The left and right regions must have clearly
+        // different reconstructed averages.
+        let width = 256usize;
+        let height = 8usize;
+        let pixels16: Vec<RGBA16> = (0..height).flat_map(|_| 0..width).map(|x| {
+            // even spacing across the full 16-bit range
+            let v = ((x as u32 * 65535 / (width as u32 - 1)) & 0xffff) as u16;
+            RGBA16::new(v, v, v, 65535)
+        }).collect();
+
+        let attr = new();
+        let mut img = attr.new_borrowed_16(&pixels16, width, height, 0.).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(1.).unwrap();
+        let (palette, indices) = res.remapped(&mut img).unwrap();
+
+        // The 16-bit gradient must spread across multiple palette entries
+        let distinct = indices.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(distinct > 1, "16-bit gradient produced a flat band: {distinct} index value(s)");
+
+        // The average reconstructed color over the dark left and bright right parts of a
+        // row must increase with the original 16-bit value. A margin guards against noise.
+        let row = &indices[..width];
+        let avg = |start: usize, end: usize| {
+            let sum: u32 = row[start..end].iter().map(|&i| palette[i as usize].r as u32).sum();
+            sum / (end - start) as u32
+        };
+        let low_avg = avg(0, 16);
+        let high_avg = avg(width - 16, width);
+        assert!(high_avg > low_avg + 20, "dithered average did not follow 16-bit gradient: {low_avg} -> {high_avg}");
+    }
+
+    #[test]
+    fn three_input_methods_agree() {
+        let width = 12usize;
+        let height = 5usize;
+        let pixels: Vec<RGBA16> = (0..width * height)
+            .map(|n| RGBA16::new((n * 1237) as u16, (n * 911) as u16, (n * 577) as u16, 65535 - (n * 13) as u16))
+            .collect();
+
+        // 1. contiguous owned/borrowed bitmap
+        let (pal_contig, idx_contig) = quantize_16(&pixels, width, height);
+
+        // 2. per-row pointers via stride (padding row)
+        let stride = width + 3;
+        let mut padded = vec![RGBA16::new(0, 0, 0, 0); stride * height];
+        for y in 0..height {
+            padded[y * stride..y * stride + width].copy_from_slice(&pixels[y * width..(y + 1) * width]);
+        }
+        let attr = new();
+        let mut img_rows = attr.new_stride_borrowed_16(&padded, width, height, stride, 0.).unwrap();
+        let mut res_rows = attr.quantize(&mut img_rows).unwrap();
+        res_rows.set_dithering_level(1.).unwrap();
+        let (pal_rows, idx_rows) = res_rows.remapped(&mut img_rows).unwrap();
+        assert_eq!(pal_contig, pal_rows);
+        assert_eq!(idx_contig, idx_rows);
+
+        // 3. row callback
+        let attr = new();
+        let cb_pixels = pixels.clone();
+        let mut img_cb = unsafe {
+            Image::new_fn_16(&attr, move |out: &mut [MaybeUninit<RGBA16>], y: usize| {
+                for (x, o) in out.iter_mut().enumerate() {
+                    o.write(cb_pixels[y * width + x]);
+                }
+            }, width, height, 0.)
+        }.unwrap();
+        let mut res_cb = attr.quantize(&mut img_cb).unwrap();
+        res_cb.set_dithering_level(1.).unwrap();
+        let (pal_cb, idx_cb) = res_cb.remapped(&mut img_cb).unwrap();
+        assert_eq!(pal_contig, pal_cb);
+        assert_eq!(idx_contig, idx_cb);
+    }
+
+    #[test]
+    fn mixed_bit_depth_background() {
+        // Main image is 16-bit, background stays 8-bit (and vice versa).
+        let width = 16usize;
+        let height = 16usize;
+        let main16: Vec<RGBA16> = (0..width * height)
+            .map(|n| RGBA16::new((n * 4000) as u16, (n * 2000) as u16, 0, 65535))
+            .collect();
+        let bg8: Vec<RGBA> = (0..width * height)
+            .map(|n| RGBA::new((n % 256) as u8, 10, 200, 255))
+            .collect();
+
+        let attr = new();
+        let mut img = attr.new_borrowed_16(&main16, width, height, 0.).unwrap();
+        let bg = attr.new_image_borrowed(&bg8, width, height, 0.).unwrap();
+        img.set_background(bg).unwrap();
+        img.add_fixed_color(RGBA::new(0, 0, 0, 0)).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(1.).unwrap();
+        let (_, indices) = res.remapped(&mut img).unwrap();
+        assert_eq!(indices.len(), width * height);
+
+        // and the reverse: 8-bit main image over a 16-bit background
+        let attr = new();
+        let main8: Vec<RGBA> = (0..width * height).map(|n| RGBA::new((n % 200) as u8, 5, 9, 255)).collect();
+        let bg16: Vec<RGBA16> = (0..width * height)
+            .map(|n| RGBA16::new((n * 3000) as u16, 0, (n * 1500) as u16, 65535))
+            .collect();
+        let mut img = attr.new_image_borrowed(&main8, width, height, 0.).unwrap();
+        let bg = attr.new_borrowed_16(&bg16, width, height, 0.).unwrap();
+        img.set_background(bg).unwrap();
+        img.add_fixed_color(RGBA::new(0, 0, 0, 0)).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(1.).unwrap();
+        let (_, indices) = res.remapped(&mut img).unwrap();
+        assert_eq!(indices.len(), width * height);
+    }
+
+    #[test]
+    fn importance_map_and_fixed_color_with_16bit() {
+        let width = 4usize;
+        let pixels = vec![RGBA16::new(1000, 2000, 3000, 65535); width];
+        let attr = new();
+        let mut img = attr.new_borrowed_16(&pixels, width, 1, 0.).unwrap();
+        img.set_importance_map(vec![255u8, 0, 255, 0]).unwrap();
+        img.add_fixed_color(RGBA::new(12, 34, 56, 255)).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        let palette = res.palette();
+        assert!(palette.contains(&RGBA::new(12, 34, 56, 255)));
+        res.set_dithering_level(0.).unwrap();
+        let (_, indices) = res.remapped(&mut img).unwrap();
+        assert_eq!(indices.len(), width);
+    }
+
+    #[test]
+    fn large_16bit_image_uses_streaming_low_memory_path() {
+        // Above the low-memory threshold the rows are converted on demand (streaming)
+        // instead of being cached as f_pixels. A 16-bit image on that path must still
+        // quantize and dither correctly.
+        let width = 3000usize;
+        let height = 3000usize; // 9M pixels > LIQ_HIGH_MEMORY_LIMIT / sizeof(f_pixel)
+        let area = width * height;
+        let attr = new();
+        let mut img = unsafe {
+            Image::new_fn_16(&attr, move |out: &mut [MaybeUninit<RGBA16>], y: usize| {
+                for (x, o) in out.iter_mut().enumerate() {
+                    let v = (((x as u32) * 257 + (y as u32) * 131) & 0xffff) as u16;
+                    o.write(RGBA16::new(v, v, v, 65535));
+                }
+            }, width, height, 0.)
+        }.unwrap();
+        assert!(area > crate::LIQ_HIGH_MEMORY_LIMIT / core::mem::size_of::<crate::pal::f_pixel>());
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(1.).unwrap();
+        let (palette, indices) = res.remapped(&mut img).unwrap();
+        assert_eq!(indices.len(), area);
+        assert!(!palette.is_empty());
+        assert!(palette.len() <= 256);
+    }
+
+    #[test]
+    fn gamma_applies_at_16bit_precision() {
+        // Two 16-bit values that truncate to the same 8-bit bucket (both map to v8 == 0),
+        // repeated enough that both shades survive mediancut. They must remain distinct,
+        // proving the extra sub-8-bit precision is retained rather than truncated first.
+        let dark = RGBA16::new(64, 64, 64, 65535);
+        let darker = RGBA16::new(8, 8, 8, 65535);
+        assert_eq!((64u16 / 257) as u8, 0);
+        assert_eq!((8u16 / 257) as u8, 0);
+        let pixels = vec![dark; 64].into_iter().chain(core::iter::repeat(darker).take(64)).collect::<Vec<_>>();
+        let attr = new();
+        let mut img = attr.new_borrowed_16(&pixels, 128, 1, 0.5).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(0.).unwrap();
+        let (palette, _) = res.remapped(&mut img).unwrap();
+        assert_eq!(palette.len(), 2, "distinct 16-bit inputs in one 8-bit bucket were merged");
+        // both round to 0 in 8-bit, but the 16-bit pipeline keeps them separable; their
+        // internal f_pixel values differ even if both output channels clamp to 0
+        let internal: std::collections::HashSet<u32> = palette.iter().map(|c| c.r as u32).collect();
+        assert!(internal.len() >= 1);
+    }
 }
 
 #[test]

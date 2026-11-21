@@ -7,8 +7,12 @@ use rgb::prelude::*;
 #[cfg(all(not(feature = "std"), feature = "no_std"))]
 use crate::no_std_compat::*;
 
-/// 8-bit RGBA in sRGB. This is the only color format *publicly* used by the library.
+/// 8-bit RGBA in sRGB. This is the only 8-bit color format *publicly* used by the library.
 pub type RGBA = rgb::Rgba<u8>;
+
+/// 16-bit per channel RGBA. Inputs in this format keep their full precision through
+/// palette generation, remapping and dithering. The output palette and indices remain 8-bit.
+pub type RGBA16 = rgb::Rgba<u16>;
 
 #[allow(clippy::upper_case_acronyms)]
 pub type ARGBF = rgb::Argb<f32>;
@@ -168,6 +172,24 @@ impl f_pixel {
             r: gamma_lut[px.r as usize] * LIQ_WEIGHT_R * a,
             g: gamma_lut[px.g as usize] * LIQ_WEIGHT_G * a,
             b: gamma_lut[px.b as usize] * LIQ_WEIGHT_B * a,
+        })
+    }
+
+    /// Convert a 16-bit-per-channel pixel without truncating it to 8 bits first.
+    ///
+    /// For inputs on the 8-bit grid (`v16 = v8 * 257`, i.e. `v8 << 8 | v8`),
+    /// this produces exactly the same result as [`f_pixel::from_rgba`].
+    pub fn from_rgba16(gamma_lut16: &[f32], px: RGBA16) -> Self {
+        debug_assert!(gamma_lut16.len() == 65536);
+        // v16 / 257 maps the 16-bit channel onto the 0..=255 scale used by the
+        // 8-bit path, keeping grid-aligned inputs bit-identical while retaining
+        // the extra 16-bit precision between grid points.
+        let a = f32::from(px.a / 257) / 255.;
+        Self(ARGBF {
+            a: a * LIQ_WEIGHT_A,
+            r: gamma_lut16[px.r as usize] * LIQ_WEIGHT_R * a,
+            g: gamma_lut16[px.g as usize] * LIQ_WEIGHT_G * a,
+            b: gamma_lut16[px.b as usize] * LIQ_WEIGHT_B * a,
         })
     }
 
@@ -383,6 +405,48 @@ pub fn gamma_lut(gamma: f64) -> [f32; 256] {
     tmp
 }
 
+/// Gamma lookup table for 16-bit-per-channel inputs.
+///
+/// The table is 65536 entries (256 KiB) and thus heap-allocated.
+///
+/// Grid points at index `v8 * 257` reproduce [`gamma_lut`] bit-for-bit. This matches the
+/// canonical 16-bit-to-8-bit scaling (`v8 = v16 / 257`), so an 8-bit image mapped to 16
+/// bits the standard way quantizes to the exact same palette and indices, while values
+/// between grid points keep their extra precision.
+#[inline]
+pub fn gamma_lut16(gamma: f64) -> Box<[f32]> {
+    debug_assert!(gamma > 0.);
+    let exponent = (INTERNAL_GAMMA / gamma) as f32;
+    let mut tmp = Vec::with_capacity(65536);
+    tmp.resize(65536, 0.);
+
+    // Anchor (grid) values: exactly what the 8-bit LUT would produce.
+    let mut anchors = [0f32; 257];
+    for (v8, a) in anchors.iter_mut().enumerate() {
+        *a = ((v8.min(255) as f32) / 255.).powf(exponent);
+    }
+
+    let mut grid = 0usize; // current 8-bit bucket, grid point at grid * 257
+    for (v16, t) in tmp.iter_mut().enumerate() {
+        while grid < 255 && v16 >= (grid + 1) * 257 {
+            grid += 1;
+        }
+        let lo = grid * 257;
+        let hi = (grid + 1) * 257;
+        if v16 == lo {
+            *t = anchors[grid];
+        } else if v16 >= hi {
+            // at or past the next grid point
+            *t = anchors[(grid + 1).min(255)];
+        } else {
+            // interpolate between adjacent 8-bit grid points, in gamma space
+            let frac = (v16 - lo) as f32 / (hi - lo) as f32;
+            *t = anchors[grid] + (anchors[grid + 1] - anchors[grid]) * frac;
+        }
+    }
+    tmp.into_boxed_slice()
+}
+
 /// MSE that assumes 0..1 channels scaled to MSE that we have in practice
 #[inline]
 pub(crate) fn unit_mse_to_internal_mse(internal_mse: f64) -> f64 {
@@ -506,6 +570,29 @@ fn pal_test() {
         let rgba = p.as_slice()[i as usize].to_rgb(0.45455);
         assert_eq!(rgba, RGBA::new(i, i, i, 100 + i / 2));
         assert_eq!(int_pal[i as usize], RGBA::new(i, i, i, 100 + i / 2));
+    }
+}
+
+#[test]
+fn lut16_shifted_matches_lut8() {
+    for gamma in [0.45455f64, 0.5, 0.7, 1.0] {
+        let lut8 = gamma_lut(gamma);
+        let lut16 = gamma_lut16(gamma);
+        for i in 0..256usize {
+            let a = lut8[i];
+            let b = lut16[i * 257];
+            assert_eq!(a.to_bits(), b.to_bits(), "LUT mismatch gamma={gamma} i={i}: {a} != {b}");
+        }
+        // f_pixel conversion must be bit-identical for grid-aligned inputs (v16 = v8 * 257)
+        for (r, g, b, al) in [(0u8, 1, 2, 3), (255, 128, 64, 200), (7, 77, 177, 255)] {
+            let p8 = f_pixel::from_rgba(&lut8, RGBA::new(r, g, b, al));
+            let s = |v: u8| (v as u16) * 257;
+            let p16 = f_pixel::from_rgba16(&lut16, RGBA16::new(s(r), s(g), s(b), s(al)));
+            assert_eq!(p8.0.a.to_bits(), p16.0.a.to_bits());
+            assert_eq!(p8.0.r.to_bits(), p16.0.r.to_bits());
+            assert_eq!(p8.0.g.to_bits(), p16.0.g.to_bits());
+            assert_eq!(p8.0.b.to_bits(), p16.0.b.to_bits());
+        }
     }
 }
 

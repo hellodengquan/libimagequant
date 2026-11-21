@@ -2,6 +2,7 @@
 #include <assert.h>
 #include "libimagequant.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static char magic[] = "magic";
@@ -164,10 +165,91 @@ static void test_fixed_colors_order() {
     liq_attr_destroy(attr);
 }
 
+static void test_16bit_inputs(void) {
+    liq_attr *attr = liq_attr_create();
+    assert(attr);
+
+    const int width = 8;
+    const int height = 4;
+    const int count = width * height;
+
+    // 1. contiguous 16-bit bitmap
+    liq_color16 *bitmap = malloc((size_t)count * sizeof(liq_color16));
+    assert(bitmap);
+    for (int i = 0; i < count; i++) {
+        unsigned short v = (unsigned short)(i * 257);
+        bitmap[i] = (liq_color16){ v, (unsigned short)(v / 2), (unsigned short)(65535 - v), 65535 };
+    }
+    liq_image *img = liq_image_create_rgba16(attr, bitmap, width, height, 0);
+    assert(img);
+
+    liq_result *res = liq_quantize_image(attr, img);
+    assert(res);
+    const liq_palette *pal = liq_get_palette(res);
+    assert(pal);
+    assert(pal->count > 0 && pal->count <= 256);
+
+    unsigned char *out = malloc((size_t)count);
+    assert(out);
+    liq_set_dithering_level(res, 1.0);
+    assert(LIQ_OK == liq_write_remapped_image(res, img, out, (size_t)count));
+    liq_result_destroy(res);
+    liq_image_destroy(img);
+    free(out);
+
+    // 2. per-row 16-bit pointers
+    void **rows = malloc((size_t)height * sizeof(void*));
+    assert(rows);
+    for (int y = 0; y < height; y++) {
+        rows[y] = (void*)&bitmap[y * width];
+    }
+    img = liq_image_create_rgba16_rows(attr, rows, width, height, 0);
+    assert(img);
+    res = liq_quantize_image(attr, img);
+    assert(res);
+    pal = liq_get_palette(res);
+    assert(pal && pal->count > 0);
+    liq_result_destroy(res);
+    liq_image_destroy(img);
+    free(rows);
+    free(bitmap);
+
+    liq_attr_destroy(attr);
+}
+
+static int custom16_calls = 0;
+static void get_rgba16_row(liq_color16 row_out[], int row, int width, void *user_info) {
+    assert(user_info == magic);
+    assert(width == 6);
+    assert(row >= 0 && row < 3);
+    for (int i = 0; i < width; i++) {
+        unsigned short v = (unsigned short)((i * 1000 + row * 333) & 0xffff);
+        row_out[i] = (liq_color16){ v, v, v, 65535 };
+    }
+    custom16_calls++;
+}
+
+static void test_16bit_custom_callback(void) {
+    liq_attr *attr = liq_attr_create();
+    assert(attr);
+    liq_image *img = liq_image_create_custom16(attr, get_rgba16_row, magic, 6, 3, 0);
+    assert(img);
+    liq_result *res = liq_quantize_image(attr, img);
+    assert(res);
+    const liq_palette *pal = liq_get_palette(res);
+    assert(pal && pal->count > 0);
+    assert(custom16_calls >= 3);
+    liq_result_destroy(res);
+    liq_image_destroy(img);
+    liq_attr_destroy(attr);
+}
+
 void run_liq_tests() {
     test_fixed_colors();
     test_fixed_colors_order();
     test_abort();
     test_histogram();
     test_zero_histogram();
+    test_16bit_inputs();
+    test_16bit_custom_callback();
 }

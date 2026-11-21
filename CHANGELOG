@@ -1,3 +1,12 @@
+version 4.5
+-----------
+ - 16-bit-per-channel RGBA input (Rust and C API), from contiguous bitmap,
+   per-row pointers, or row callback. Full 16-bit precision is preserved through
+   palette generation, remapping and dithering; output stays an 8-bit palette.
+ - 16-bit images combine correctly with background frames, importance maps and
+   fixed colors, and background frames may use a different bit depth.
+ - low-memory streaming mode supports 16-bit inputs. 8-bit inputs are unchanged.
+
 version 4.4
 -----------
  - palette quality improvements

@@ -53,11 +53,13 @@ pub struct liq_histogram {
 pub type liq_palette = Palette;
 pub type liq_histogram_entry = HistogramEntry;
 pub type liq_color = RGBA;
+pub type liq_color16 = RGBA16;
 
 pub type liq_log_callback_function = unsafe extern "C" fn(liq: &liq_attr, message: *const c_char, user_info: AnySyncSendPtr);
 pub type liq_log_flush_callback_function = unsafe extern "C" fn(liq: &liq_attr, user_info: AnySyncSendPtr);
 pub type liq_progress_callback_function = unsafe extern "C" fn(progress_percent: f32, user_info: AnySyncSendPtr) -> c_int;
 pub type liq_image_get_rgba_row_callback = unsafe extern "C" fn(row_out: *mut MaybeUninit<RGBA>, row: c_int, width: c_int, user_info: AnySyncSendPtr);
+pub type liq_image_get_rgba16_row_callback = unsafe extern "C" fn(row_out: *mut MaybeUninit<RGBA16>, row: c_int, width: c_int, user_info: AnySyncSendPtr);
 
 bitflags::bitflags! {
     #[repr(C)]
@@ -602,13 +604,21 @@ fn store_boxed_result<T>(res: Result<T, liq_error>, out: &mut MaybeUninit<Option
 }
 
 pub(crate) fn check_image_size(attr: &liq_attr, width: u32, height: u32) -> bool {
+    check_image_size_bpp(attr, width, height, mem::size_of::<liq_color>())
+}
+
+pub(crate) fn check_image_size_16(attr: &liq_attr, width: u32, height: u32) -> bool {
+    check_image_size_bpp(attr, width, height, mem::size_of::<liq_color16>())
+}
+
+fn check_image_size_bpp(attr: &liq_attr, width: u32, height: u32, bytes_per_pixel: usize) -> bool {
     if bad_object!(attr, LIQ_ATTR_MAGIC) { return false; }
 
     if width == 0 || height == 0 {
         return false;
     }
 
-    if width as usize > c_int::MAX as usize / mem::size_of::<liq_color>() / height as usize ||
+    if width as usize > c_int::MAX as usize / bytes_per_pixel / height as usize ||
        width as usize > c_int::MAX as usize / 16 / mem::size_of::<f32>() ||
        height as usize > c_int::MAX as usize / mem::size_of::<usize>()
     {
@@ -651,6 +661,59 @@ pub unsafe extern "C" fn liq_image_create_rgba<'pixels>(attr: &liq_attr, pixels:
     if !check_image_size(attr, width, height) { return None; }
     let rows = (0..height as usize).map(move |i| pixels.add(width as usize * i)).collect();
     liq_image_create_rgba_bitmap_impl(&attr.inner, rows, width as _, height as _, gamma)
+        .map(move |inner| Box::new(liq_image {
+            magic_header: LIQ_IMAGE_MAGIC,
+            inner: ManuallyDrop::new(inner),
+            c_api_free: attr.c_api_free,
+        }))
+}
+
+/// 16-bit-per-channel counterpart of [`liq_image_create_rgba`].
+///
+/// The bitmap is a contiguous array of `width*height` `liq_color16` values (8 bytes each).
+/// The full 16-bit precision is used for palette generation, remapping and dithering;
+/// the output palette and indices remain 8-bit.
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn liq_image_create_rgba16<'pixels>(attr: &liq_attr, pixels: *const liq_color16, width: c_uint, height: c_uint, gamma: f64) -> Option<Box<liq_image<'pixels>>> {
+    if liq_received_invalid_pointer(pixels.cast()) { return None; }
+    if !check_image_size_16(attr, width, height) { return None; }
+    let rows = (0..height as usize).map(move |i| pixels.add(width as usize * i)).collect();
+    liq_image_create_rgba16_bitmap_impl(&attr.inner, rows, width as _, height as _, gamma)
+        .map(move |inner| Box::new(liq_image {
+            magic_header: LIQ_IMAGE_MAGIC,
+            inner: ManuallyDrop::new(inner),
+            c_api_free: attr.c_api_free,
+        }))
+}
+
+/// 16-bit-per-channel counterpart of [`liq_image_create_rgba_rows`].
+///
+/// Each element of `rows` points to a line of `width` `liq_color16` values.
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn liq_image_create_rgba16_rows<'rows>(attr: &liq_attr, rows: *const *const RGBA16, width: c_uint, height: c_uint, gamma: f64) -> Option<Box<liq_image<'rows>>> {
+    if !check_image_size_16(attr, width, height) { return None; }
+    if rows.is_null() { return None; }
+    let rows = slice::from_raw_parts(rows, height as _);
+    liq_image_create_rgba16_rows_impl(&attr.inner, rows, width as _,  height as _, gamma)
+        .map(move |inner| Box::new(liq_image {
+            magic_header: LIQ_IMAGE_MAGIC,
+            inner: ManuallyDrop::new(inner),
+            c_api_free: attr.c_api_free,
+        }))
+}
+
+/// 16-bit-per-channel counterpart of [`liq_image_create_custom`].
+///
+/// The callback fills a row of `liq_color16` values on demand.
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn liq_image_create_custom16(attr: &liq_attr, row_callback: liq_image_get_rgba16_row_callback, user_info: AnySyncSendPtr, width: c_uint, height: c_uint, gamma: f64)
+ -> Option<Box<liq_image<'static>>> {
+    if !check_image_size_16(attr, width, height) { return None; }
+    let cb: Box<dyn Fn(&mut [MaybeUninit<RGBA16>], usize) + Send + Sync> = Box::new(move |row, y| row_callback(row.as_mut_ptr(), y as _, row.len() as _, user_info));
+    liq_image_create_custom16_impl(&attr.inner, cb, width as _, height as _, gamma)
         .map(move |inner| Box::new(liq_image {
             magic_header: LIQ_IMAGE_MAGIC,
             inner: ManuallyDrop::new(inner),
@@ -740,6 +803,9 @@ fn link_every_symbol() {
         + liq_set_last_index_transparent as *const c_void as usize
         + liq_image_create_rgba_rows as *const c_void as usize
         + liq_image_create_rgba as *const c_void as usize
+        + liq_image_create_rgba16_rows as *const c_void as usize
+        + liq_image_create_rgba16 as *const c_void as usize
+        + liq_image_create_custom16 as *const c_void as usize
         + liq_image_set_memory_ownership as *const c_void as usize
         + liq_set_log_callback as *const c_void as usize
         + liq_set_log_flush_callback as *const c_void as usize

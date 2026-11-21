@@ -80,6 +80,33 @@ impl Attributes {
         Image::new(self, pixels, width, height, gamma)
     }
 
+    /// Make an image from 16-bit-per-channel RGBA pixels.
+    ///
+    /// The full 16-bit precision is preserved through palette generation, remapping and dithering.
+    /// The output palette and indices remain 8-bit. See [`Image::new_16`].
+    #[inline]
+    pub fn new_image_16<VecRGBA16>(&self, pixels: VecRGBA16, width: usize, height: usize, gamma: f64) -> Result<Image<'static>, Error> where VecRGBA16: Into<Box<[crate::RGBA16]>> {
+        Image::new_16(self, pixels, width, height, gamma)
+    }
+
+    /// 16-bit counterpart of [`Attributes::new_image_borrowed`].
+    #[inline]
+    pub fn new_borrowed_16<'pixels>(&self, bitmap: &'pixels [crate::RGBA16], width: usize, height: usize, gamma: f64) -> Result<Image<'pixels>, Error> {
+        Image::new_borrowed_16(self, bitmap, width, height, gamma)
+    }
+
+    /// 16-bit counterpart of [`Attributes::new_image_stride`].
+    #[inline]
+    pub fn new_image_stride_16<VecRGBA16>(&self, pixels: VecRGBA16, width: usize, height: usize, stride: usize, gamma: f64) -> Result<Image<'static>, Error> where VecRGBA16: Into<Box<[crate::RGBA16]>> {
+        Image::new_stride_16(self, pixels, width, height, stride, gamma)
+    }
+
+    /// 16-bit counterpart of [`Attributes::new_image_borrowed`] with a pixel stride.
+    #[inline]
+    pub fn new_stride_borrowed_16<'pixels>(&self, bitmap: &'pixels [crate::RGBA16], width: usize, height: usize, stride: usize, gamma: f64) -> Result<Image<'pixels>, Error> {
+        Image::new_stride_borrowed_16(self, bitmap, width, height, stride, gamma)
+    }
+
     /// Generate palette for the image
     pub fn quantize(&self, image: &mut Image<'_>) -> Result<QuantizationResult, Error> {
         let mut hist = Histogram::new(self);

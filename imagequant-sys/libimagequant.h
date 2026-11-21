@@ -13,8 +13,8 @@
 #define LIQ_EXPORT extern
 #endif
 
-#define LIQ_VERSION 40003
-#define LIQ_VERSION_STRING "4.0.3"
+#define LIQ_VERSION 40300
+#define LIQ_VERSION_STRING "4.3.0"
 
 #ifndef LIQ_PRIVATE
 #if defined(__GNUC__) || defined (__llvm__)
@@ -42,6 +42,13 @@ typedef struct liq_histogram liq_histogram;
 typedef struct liq_color {
     unsigned char r, g, b, a;
 } liq_color;
+
+/* 16-bit-per-channel RGBA. Inputs in this format keep their full precision
+   through palette generation, remapping and dithering. The output palette
+   and pixel indices remain 8-bit. */
+typedef struct liq_color16 {
+    unsigned short r, g, b, a;
+} liq_color16;
 
 typedef struct liq_palette {
     unsigned int count;
@@ -110,6 +117,15 @@ LIQ_EXPORT LIQ_USERESULT liq_image *liq_image_create_rgba(const liq_attr *attr, 
 
 typedef void liq_image_get_rgba_row_callback(liq_color row_out[], int row, int width, void* user_info);
 LIQ_EXPORT LIQ_USERESULT liq_image *liq_image_create_custom(const liq_attr *attr, liq_image_get_rgba_row_callback *row_callback, void* user_info, int width, int height, double gamma);
+
+// 16-bit-per-channel equivalents of the functions above.
+// The bitmap/rows contain liq_color16 values (8 bytes per pixel). All processing uses the
+// full 16-bit precision, but the resulting palette and indices are still 8-bit.
+LIQ_EXPORT LIQ_USERESULT liq_image *liq_image_create_rgba16_rows(const liq_attr *attr, void *const rows[], int width, int height, double gamma) LIQ_NONNULL;
+LIQ_EXPORT LIQ_USERESULT liq_image *liq_image_create_rgba16(const liq_attr *attr, const void *bitmap, int width, int height, double gamma) LIQ_NONNULL;
+
+typedef void liq_image_get_rgba16_row_callback(liq_color16 row_out[], int row, int width, void* user_info);
+LIQ_EXPORT LIQ_USERESULT liq_image *liq_image_create_custom16(const liq_attr *attr, liq_image_get_rgba16_row_callback *row_callback, void* user_info, int width, int height, double gamma);
 
 LIQ_EXPORT liq_error liq_image_set_memory_ownership(liq_image *image, int ownership_flags) LIQ_NONNULL;
 LIQ_EXPORT liq_error liq_image_set_background(liq_image *img, liq_image *background_image) LIQ_NONNULL;

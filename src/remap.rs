@@ -5,7 +5,7 @@ use crate::nearest::Nearest;
 use crate::pal::{f_pixel, PalF, PalIndexRemap, Palette, ARGBF};
 use crate::quant::QuantizationResult;
 use crate::rayoff::*;
-use crate::rows::{temp_buf, DynamicRows};
+use crate::rows::{temp_buf, DynamicRows, OwnedTempRow};
 use crate::seacow::{RowBitmap, RowBitmapMut};
 use crate::CacheLineAlign;
 use core::cell::RefCell;
@@ -39,18 +39,36 @@ pub(crate) fn remap_to_palette<'x, 'b: 'x>(px: &mut DynamicRows, background: Opt
 
     let tls = ThreadLocal::new();
     let width = px.width as usize;
-    let per_thread_buffers = move || -> Result<_, Error> { Ok(CacheLineAlign(RefCell::new((Kmeans::new(palette_len)?, temp_buf(width)?, temp_buf(width)?, temp_buf(width)?)))) };
+    let input_is_16bit = px.is_16bit();
+    let background_is_16bit = background.as_ref().map(|bg| bg.px.is_16bit()).unwrap_or(false);
+    let has_background = background.is_some();
+    let per_thread_buffers = move || -> Result<_, Error> {
+        Ok(CacheLineAlign(RefCell::new((
+            Kmeans::new(palette_len)?,
+            if input_is_16bit { OwnedTempRow::Bit16(temp_buf(width)?) } else { OwnedTempRow::Bit8(temp_buf(width)?) },
+            temp_buf(width)?,
+            temp_buf(width)?,
+            // scratch row for the background, which may be a different bit depth
+            if has_background { Some(if background_is_16bit { OwnedTempRow::Bit16(temp_buf(width)?) } else { OwnedTempRow::Bit8(temp_buf(width)?) }) } else { None },
+        ))))
+    };
 
-    let tls_tmp1 = tls.get_or_try(per_thread_buffers)?;
+    // The closure is Fn (not FnOnce) because it is invoked once per worker thread,
+    // so it must be passed by reference rather than moved.
+    #[allow(clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
+    let tls_tmp1 = tls.get_or_try(&per_thread_buffers)?;
     let mut tls_tmp = tls_tmp1.0.borrow_mut();
 
-    let input_rows = px.rows_iter(&mut tls_tmp.1)?;
+    let input_rows = px.rows_iter(tls_tmp.1.as_temp_row())?;
     let (background, transparent_index) = background.map(|background| {
         (Some(background), n.search(&f_pixel::default(), 0).0 as PalIndexRemap)
     })
     .filter(|&(_, transparent_index)| colors[usize::from(transparent_index)].is_fully_transparent())
     .unwrap_or((None, 0));
-    let background = background.map(|bg| bg.px.rows_iter(&mut tls_tmp.1)).transpose()?;
+    let background = background.map(|bg| {
+        let mut bg_temp = OwnedTempRow::for_rows(&bg.px)?;
+        bg.px.rows_iter(bg_temp.as_temp_row())
+    }).transpose()?;
 
     if background.is_some() {
         tls_tmp.0.update_color(f_pixel::default(), 1., transparent_index as _);
@@ -61,14 +79,17 @@ pub(crate) fn remap_to_palette<'x, 'b: 'x>(px: &mut DynamicRows, background: Opt
     let remapping_error = output_pixels.rows_mut().enumerate().par_bridge().map(|(row, output_pixels_row)| {
         let mut remapping_error = 0.;
         #[allow(irrefutable_let_patterns)]
-        let Ok(tls_res) = tls.get_or_try(per_thread_buffers) else { return f64::NAN };
-        let (kmeans, temp_row, temp_row_f, temp_row_f_bg) = &mut *tls_res.0.borrow_mut();
+        #[allow(clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
+        let Ok(tls_res) = tls.get_or_try(&per_thread_buffers) else { return f64::NAN };
+        let (kmeans, temp_row, temp_row_f, temp_row_f_bg, bg_temp_row) = &mut *tls_res.0.borrow_mut();
 
         let output_pixels_row = &mut output_pixels_row[..width];
         let importance_map = importance_map.and_then(|m| m.get(row * width..)).unwrap_or(&[]);
-        let row_pixels = &input_rows.row_f_shared(temp_row, temp_row_f, row)[..width];
-        let bg_pixels = if let Some(background) = &background  {
-            &background.row_f_shared(temp_row, temp_row_f_bg, row)[..width]
+        let row_pixels = &input_rows.row_f_shared(temp_row.as_temp_row(), temp_row_f, row)[..width];
+        let bg_pixels = if let Some(background) = &background {
+            // The background may have a different bit depth than the main image
+            let bg_temp_row = bg_temp_row.as_mut().expect("background scratch row missing");
+            &background.row_f_shared(bg_temp_row.as_temp_row(), temp_row_f_bg, row)[..width]
         } else { &[] };
 
         let mut last_match = 0;
@@ -154,7 +175,7 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
     let width = input_image.width();
     let height = input_image.height();
 
-    let mut temp_row = temp_buf(width)?;
+    let mut temp_row = OwnedTempRow::for_rows(&input_image.px)?;
 
     let dither_map = if quant.use_dither_map != DitherMapMode::None {
         input_image.dither_map.as_deref().or(input_image.edges.as_deref()).unwrap_or(&[])
@@ -166,7 +187,8 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
     let palette = palette.as_slice();
 
     let mut background = input_image.background.as_mut().map(|bg| {
-        bg.px.prepare_iter(&mut temp_row, true)?;
+        let mut bg_temp_row = OwnedTempRow::for_rows(&bg.px)?;
+        bg.px.prepare_iter(bg_temp_row.as_temp_row(), true)?;
         Ok::<_, Error>(&bg.px)
     }).transpose()?;
 
@@ -184,8 +206,9 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
     // (guesses are only for speed, don't affect visuals)
     let guess_from_remapped_pixels = output_image_is_remapped && background.is_none();
 
-    input_image.px.prepare_iter(&mut temp_row, true)?;
+    input_image.px.prepare_iter(temp_row.as_temp_row(), true)?;
     let input_image_px = &input_image.px;
+    let background_is_16bit = background.map(|bg| bg.is_16bit()).unwrap_or(false);
     let n = &n;
 
     // Chunks have overhead, so should be big (more than 2 bring diminishing results). Chunks risk causing seams, so should be tall.
@@ -195,7 +218,12 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
         let mut chunk_start_row = 0;
         for mut chunk in chunks {
             let chunk_len = chunk.0.len();
-            let mut temp_row = temp_buf(width)?;
+            let mut temp_row = OwnedTempRow::for_rows(input_image_px)?;
+            let mut bg_temp_row = if background_is_16bit {
+                OwnedTempRow::Bit16(temp_buf(width)?)
+            } else {
+                OwnedTempRow::Bit8(temp_buf(width)?)
+            };
             let mut input_image_iter = input_image_px.rows_iter_prepared()?;
             let mut background = background.map(|bg| bg.rows_iter_prepared()).transpose()?;
             let mut diffusion = Vec::new();
@@ -208,8 +236,8 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
             if chunk_start_row > 2 {
                 let mut discard_row = temp_buf(width)?;
                 for row in (chunk_start_row - 2) .. chunk_start_row {
-                    let row_pixels = input_image_iter.row_f(&mut temp_row, row as _);
-                    let bg_pixels = background.as_mut().map(|b| b.row_f(&mut temp_row, row as _)).unwrap_or(&[]);
+                    let row_pixels = input_image_iter.row_f(temp_row.as_temp_row(), row as _);
+                    let bg_pixels = background.as_mut().map(|b| b.row_f(bg_temp_row.as_temp_row(), row as _)).unwrap_or(&[]);
                     let dither_map = dither_map.get(row * width .. row * width + width).unwrap_or(&[]);
                     let scan_forward = row & 1 == 0;
                     dither_row(row_pixels, &mut discard_row, width as u32, dither_map, base_dithering_level, max_dither_error, n, palette, transparent_index, bg_pixels, guess_from_remapped_pixels, &mut diffusion, scan_forward);
@@ -222,8 +250,8 @@ pub(crate) fn remap_to_palette_floyd(input_image: &mut Image, mut output_pixels:
             s.spawn(move |_| {
                 for (chunk_row, output_pixels_row) in chunk.0.rows_mut().enumerate() {
                     let row = chunk_start_row + chunk_row;
-                    let row_pixels = input_image_iter.row_f(&mut temp_row, row as _);
-                    let bg_pixels = background.as_mut().map(|b| b.row_f(&mut temp_row, row as _)).unwrap_or(&[]);
+                    let row_pixels = input_image_iter.row_f(temp_row.as_temp_row(), row as _);
+                    let bg_pixels = background.as_mut().map(|b| b.row_f(bg_temp_row.as_temp_row(), row as _)).unwrap_or(&[]);
                     let dither_map = dither_map.get(row * width .. row * width + width).unwrap_or(&[]);
                     let scan_forward = row & 1 == 0;
                     dither_row(row_pixels, output_pixels_row, width as u32, dither_map, base_dithering_level, max_dither_error, n, palette, transparent_index, bg_pixels, guess_from_remapped_pixels, &mut diffusion, scan_forward);

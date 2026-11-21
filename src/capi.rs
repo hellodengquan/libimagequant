@@ -7,13 +7,13 @@
 use crate::no_std_compat::*;
 
 use crate::pal::Palette;
-use crate::rows::RowCallback;
+use crate::rows::{RowCallback, RowCallback16};
 use crate::seacow::{Pointer, RowBitmapMut, SeaCow};
-use crate::{Attributes, Error, Image, QuantizationResult, RGBA};
+use crate::{Attributes, Error, Image, QuantizationResult, RGBA, RGBA16};
 use core::ffi::c_void;
 use core::mem::{self, MaybeUninit};
 
-pub const LIQ_VERSION: u32 = 40202;
+pub const LIQ_VERSION: u32 = 40300;
 
 #[must_use]
 pub fn liq_get_palette_impl(r: &mut QuantizationResult) -> &Palette {
@@ -43,6 +43,31 @@ pub unsafe fn liq_image_create_rgba_bitmap_impl<'rows>(attr: &Attributes, rows: 
 #[must_use]
 pub unsafe fn liq_image_create_custom_impl<'rows>(attr: &Attributes, row_callback: Box<RowCallback<'rows>>, width: u32, height: u32, gamma: f64) -> Option<Image<'rows>> {
     Image::new_internal(attr, crate::rows::PixelsSource::Callback(row_callback), width, height, gamma).ok()
+}
+
+#[must_use]
+pub unsafe fn liq_image_create_rgba16_rows_impl<'rows>(attr: &Attributes, rows: &'rows [*const RGBA16], width: u32, height: u32, gamma: f64) -> Option<crate::image::Image<'rows>> {
+    let rows = SeaCow::borrowed(&*(rows as *const [*const rgb::Rgba<u16>] as *const [Pointer<rgb::Rgba<u16>>]));
+    let rows_slice = rows.as_slice();
+    if rows_slice.iter().any(|r| r.0.is_null()) {
+        return None;
+    }
+    crate::image::Image::new_internal(attr, crate::rows::PixelsSource::Pixels16 { rows, pixels: None }, width, height, gamma).ok()
+}
+
+#[must_use]
+pub unsafe fn liq_image_create_rgba16_bitmap_impl<'rows>(attr: &Attributes, rows: Box<[*const RGBA16]>, width: u32, height: u32, gamma: f64) -> Option<crate::image::Image<'rows>> {
+    let rows = SeaCow::boxed(mem::transmute::<Box<[*const RGBA16]>, Box<[Pointer<RGBA16>]>>(rows));
+    let rows_slice = rows.as_slice();
+    if rows_slice.iter().any(|r| r.0.is_null()) {
+        return None;
+    }
+    crate::image::Image::new_internal(attr, crate::rows::PixelsSource::Pixels16 { rows, pixels: None }, width, height, gamma).ok()
+}
+
+#[must_use]
+pub unsafe fn liq_image_create_custom16_impl<'rows>(attr: &Attributes, row_callback: Box<RowCallback16<'rows>>, width: u32, height: u32, gamma: f64) -> Option<Image<'rows>> {
+    Image::new_internal(attr, crate::rows::PixelsSource::Callback16(row_callback), width, height, gamma).ok()
 }
 
 pub unsafe fn liq_write_remapped_image_impl(result: &mut QuantizationResult, input_image: &mut Image, buffer_bytes: &mut [MaybeUninit<u8>]) -> Result<(), Error> {

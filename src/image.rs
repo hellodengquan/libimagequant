@@ -1,9 +1,9 @@
 use crate::attr::Attributes;
 use crate::blur::{liq_blur, liq_max3, liq_min3};
 use crate::error::*;
-use crate::pal::{f_pixel, PalF, PalIndexRemap, MAX_COLORS, RGBA};
+use crate::pal::{f_pixel, PalF, PalIndexRemap, MAX_COLORS, RGBA, RGBA16};
 use crate::remap::DitherMapMode;
-use crate::rows::{DynamicRows, PixelsSource};
+use crate::rows::{DynamicRows, PixelsSource, RowCallback16};
 use crate::seacow::{RowBitmap, SeaCow};
 use crate::{PushInCapacity, LIQ_HIGH_MEMORY_LIMIT};
 use rgb::prelude::*;
@@ -71,6 +71,41 @@ impl<'pixels> Image<'pixels> {
         let width = width.try_into().map_err(|_| ValueOutOfRange)?;
         let height = height.try_into().map_err(|_| ValueOutOfRange)?;
         Image::new_internal(attr, PixelsSource::Callback(Box::new(convert_row_fn)), width, height, gamma)
+    }
+
+    /// Makes an image from 16-bit-per-channel RGBA pixels.
+    ///
+    /// Unlike truncating the input to 8 bits, the full 16-bit precision is preserved through
+    /// palette generation, remapping and dithering. The output palette and pixel indices are still 8-bit.
+    ///
+    /// The `pixels` argument can be `Vec<RGBA16>`, or `Box<[RGBA16]>` or `&[RGBA16]`.
+    ///
+    /// Use `0.` for gamma if the image is sRGB (most images are).
+    #[inline(always)]
+    pub fn new_16<VecRGBA16>(attr: &Attributes, pixels: VecRGBA16, width: usize, height: usize, gamma: f64) -> Result<Image<'static>, Error> where VecRGBA16: Into<Box<[RGBA16]>> {
+        Self::new_stride_16(attr, pixels, width, height, width, gamma)
+    }
+
+    /// Same as [`Image::new_16`], except it doesn't copy the pixels, but holds a temporary reference instead.
+    #[inline(always)]
+    pub fn new_borrowed_16(attr: &Attributes, pixels: &'pixels [RGBA16], width: usize, height: usize, gamma: f64) -> Result<Self, Error> {
+        Self::new_stride_borrowed_16(attr, pixels, width, height, width, gamma)
+    }
+
+    /// Generate 16-bit RGBA rows on demand using a callback function.
+    ///
+    /// This is the 16-bit counterpart of [`Image::new_fn`]. The callback receives a row of
+    /// [`RGBA16`] pixels and MUST initialize the entire row. It will be called multiple times
+    /// per row, and may be called from multiple threads at once.
+    ///
+    /// ## Safety
+    ///
+    /// The callback function MUST initialize the entire row (call `write` on every `MaybeUninit` pixel).
+    pub unsafe fn new_fn_16<F: 'pixels + Fn(&mut [MaybeUninit<RGBA16>], usize) + Send + Sync>(attr: &Attributes, convert_row_fn: F, width: usize, height: usize, gamma: f64) -> Result<Self, Error> {
+        let width = width.try_into().map_err(|_| ValueOutOfRange)?;
+        let height = height.try_into().map_err(|_| ValueOutOfRange)?;
+        let cb: Box<RowCallback16<'pixels>> = Box::new(convert_row_fn);
+        Image::new_internal(attr, PixelsSource::Callback16(cb), width, height, gamma)
     }
 
     pub(crate) fn free_histogram_inputs(&mut self) {
@@ -334,6 +369,34 @@ impl<'pixels> Image<'pixels> {
             Ok(p) => p,
             Err(e) => {
                 attr.verbose_print(format!("Buffer length is {} bytes, which is not enough for {}×{}×4 RGBA bytes", pixels_len * 4, stride, height));
+                return Err(e);
+            },
+        };
+        Image::new_internal(attr, pixels_rows, width, height, gamma)
+    }
+
+    /// Stride is in pixels. 16-bit counterpart of [`Image::new_stride_borrowed`].
+    #[inline(always)]
+    pub fn new_stride_borrowed_16(attr: &Attributes, pixels: &'pixels [RGBA16], width: usize, height: usize, stride: usize, gamma: f64) -> Result<Self, Error> {
+        Self::new_stride_internal_16(attr, SeaCow::borrowed(pixels), width, height, stride, gamma)
+    }
+
+    /// 16-bit counterpart of [`Image::new_stride`]. Copies `pixels` to an internal buffer.
+    #[inline]
+    pub fn new_stride_16<VecRGBA16>(attr: &Attributes, pixels: VecRGBA16, width: usize, height: usize, stride: usize, gamma: f64) -> Result<Image<'static>, Error> where VecRGBA16: Into<Box<[RGBA16]>> {
+        Self::new_stride_internal_16(attr, SeaCow::boxed(pixels.into()), width, height, stride, gamma)
+    }
+
+    fn new_stride_internal_16<'a>(attr: &Attributes, pixels: SeaCow<'a, RGBA16>, width: usize, height: usize, stride: usize, gamma: f64) -> Result<Image<'a>, Error> {
+        let width = width.try_into().map_err(|_| ValueOutOfRange)?;
+        let height = height.try_into().map_err(|_| ValueOutOfRange)?;
+        let stride = stride.try_into().map_err(|_| ValueOutOfRange)?;
+
+        let pixels_len = pixels.as_slice().len();
+        let pixels_rows = match PixelsSource::for_pixels16(pixels, width, height, stride) {
+            Ok(p) => p,
+            Err(e) => {
+                attr.verbose_print(format!("Buffer length is {} bytes, which is not enough for {}×{}×8 RGBA16 bytes", pixels_len * 8, stride, height));
                 return Err(e);
             },
         };

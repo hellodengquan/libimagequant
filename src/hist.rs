@@ -1,6 +1,6 @@
 use crate::error::*;
 use crate::image::Image;
-use crate::pal::{f_pixel, gamma_lut, PalIndex, ARGBF, MAX_COLORS, RGBA};
+use crate::pal::{f_pixel, gamma_lut, gamma_lut16, PalIndex, ARGBF, MAX_COLORS, RGBA, RGBA16};
 use crate::quant::QuantizationResult;
 use crate::rows::{temp_buf, DynamicRows};
 use crate::Attributes;
@@ -39,6 +39,10 @@ pub struct Histogram {
     /// The key is the RGBA cast to u32
     /// The value is a (boosted) count or 0 if it's a fixed color
     hashmap: HashMap<u32, (u32, RGBA), U32Hasher>,
+
+    /// 16-bit-per-channel colors. The key packs four u16 channels into a u64.
+    /// Kept separate so 8-bit inputs keep their exact original behavior.
+    hashmap16: HashMap<u64, (u32, RGBA16), U32Hasher>,
 
     posterize_bits: u8,
     max_histogram_entries: u32,
@@ -96,6 +100,7 @@ impl Histogram {
             max_histogram_entries: attr.max_histogram_entries,
             fixed_colors: HashSet::with_hasher(U32Hasher(0)),
             hashmap: HashMap::with_hasher(U32Hasher(0)),
+            hashmap16: HashMap::with_hasher(U32Hasher(0)),
             gamma: None,
         }
     }
@@ -129,7 +134,11 @@ impl Histogram {
         let estimated_colors = (surface_area / (posterize_bits as usize + if surface_area > 512 * 512 { 7 } else { 5 })).min(250_000);
         self.reserve(estimated_colors);
 
-        self.add_pixel_rows(&image.px, image.importance_map.as_deref(), posterize_bits)?;
+        if image.px.is_16bit() {
+            self.add_pixel_rows16(&image.px, image.importance_map.as_deref(), posterize_bits)?;
+        } else {
+            self.add_pixel_rows(&image.px, image.importance_map.as_deref(), posterize_bits)?;
+        }
 
         Ok(())
     }
@@ -191,7 +200,7 @@ impl Histogram {
 
     #[inline(never)]
     pub(crate) fn quantize_internal(&mut self, attr: &Attributes, freeze_result_colors: bool) -> Result<QuantizationResult, Error> {
-        if self.hashmap.is_empty() && self.fixed_colors.is_empty() {
+        if self.hashmap.is_empty() && self.hashmap16.is_empty() && self.fixed_colors.is_empty() {
             return Err(Unsupported);
         }
 
@@ -224,15 +233,39 @@ impl Histogram {
             .or_insert((boost, rgba));
     }
 
+    #[inline(always)]
+    fn add_color16(&mut self, rgba: RGBA16, boost: u32) {
+        if boost == 0 {
+            return;
+        }
+
+        let px_int = if rgba.a != 0 {
+            self.posterize_mask16() & rgba16_key(rgba)
+        } else { 0 };
+
+        self.hashmap16.entry(px_int)
+            .and_modify(move |e| e.0 = e.0.saturating_add(boost))
+            .or_insert((boost, rgba));
+    }
+
     fn reserve(&mut self, entries: usize) {
         let new_entries = entries.saturating_sub(self.hashmap.len() / 3); // assume some will be dupes, if called multiple times
         self.hashmap.reserve(new_entries);
+        let new_entries16 = entries.saturating_sub(self.hashmap16.len() / 3);
+        self.hashmap16.reserve(new_entries16);
     }
 
     #[inline(always)]
     const fn posterize_mask(&self) -> u32 {
         let channel_mask = 255 << self.posterize_bits;
         u32::from_ne_bytes([channel_mask, channel_mask, channel_mask, channel_mask])
+    }
+
+    /// Posterization mask for four 16-bit channels packed in a u64.
+    #[inline(always)]
+    const fn posterize_mask16(&self) -> u64 {
+        let channel_mask = (65535u64) << self.posterize_bits;
+        channel_mask | (channel_mask << 16) | (channel_mask << 32) | (channel_mask << 48)
     }
 
     /// optionallys et
@@ -247,6 +280,13 @@ impl Histogram {
         let old_hashmap = mem::replace(&mut self.hashmap, HashMap::with_capacity_and_hasher(new_size, U32Hasher(0)));
         self.hashmap.extend(old_hashmap.into_iter().map(move |(k, v)| {
             (k & new_posterize_mask, v)
+        }));
+
+        let new_posterize_mask16 = self.posterize_mask16();
+        let new_size16 = (self.hashmap16.len() / 3).max(self.hashmap16.capacity() / 5);
+        let old_hashmap16 = mem::replace(&mut self.hashmap16, HashMap::with_capacity_and_hasher(new_size16, U32Hasher(0)));
+        self.hashmap16.extend(old_hashmap16.into_iter().map(move |(k, v)| {
+            (k & new_posterize_mask16, v)
         }));
     }
 
@@ -276,6 +316,33 @@ impl Histogram {
         Ok(())
     }
 
+    pub(crate) fn add_pixel_rows16(&mut self, image: &DynamicRows<'_, '_>, importance_map: Option<&[u8]>, posterize_bits: u8) -> Result<(), Error> {
+        let width = image.width as usize;
+        let height = image.height as usize;
+
+        debug_assert!(importance_map.map_or(true, |m| m.len() == image.width() * image.height()));
+        debug_assert!(image.is_16bit());
+
+        let mut importance_map = importance_map.unwrap_or(&[]).chunks_exact(width).fuse();
+        let image_iter = image.rgba_rows_iter()?;
+
+        let mut temp_row = temp_buf(width)?;
+        for row in 0..height {
+            let pixels_row = &image_iter.row_rgba16(&mut temp_row, row)[..width];
+            let importance_map = importance_map.next().map(move |m| &m[..width]).unwrap_or(&[]);
+            for (col, px) in pixels_row.iter().copied().enumerate() {
+                let boost = importance_map.get(col).copied().unwrap_or(255);
+                self.add_color16(px, boost.into());
+            }
+        }
+        self.init_posterize_bits(posterize_bits);
+
+        if self.hashmap16.len() > self.max_histogram_entries as usize && self.posterize_bits < 3 {
+            self.init_posterize_bits(self.posterize_bits + 1);
+        }
+        Ok(())
+    }
+
     pub(crate) fn finalize_builder(&mut self, gamma: f64) -> Result<HistogramInternal, Error> {
         debug_assert!(gamma > 0.);
 
@@ -289,8 +356,9 @@ impl Histogram {
             self.hashmap.insert(px_int, (0, rgba));
         }
 
+        let total_entries = self.hashmap.len() + self.hashmap16.len();
         let mut temp = Vec::new();
-        temp.try_reserve_exact(self.hashmap.len())?;
+        temp.try_reserve_exact(total_entries)?;
 
         let mut counts = [0; LIQ_MAXCLUSTER];
         temp.extend(self.hashmap.values().map(|&(boost, color)| {
@@ -299,7 +367,14 @@ impl Histogram {
 
             // fixed colors result in weight == 0.
             let weight = boost as f32;
-            TempHistItem { color, weight, cluster_index }
+            TempHistItem::Bit8 { color, weight, cluster_index }
+        }));
+        temp.extend(self.hashmap16.values().map(|&(boost, color)| {
+            let cluster_index = (((color.r >> 15) << 3) | ((color.g >> 15) << 2) | ((color.b >> 15) << 1) | (color.a >> 15)) as u8;
+            counts[cluster_index as usize] += 1;
+
+            let weight = boost as f32;
+            TempHistItem::Bit16 { color, weight, cluster_index }
         }));
 
         let mut clusters = [Cluster { begin: 0, end: 0 }; LIQ_MAXCLUSTER];
@@ -323,24 +398,33 @@ impl Histogram {
 
         // Limit perceptual weight to 1/10th of the image surface area to prevent
         // a single color from dominating all others.
-        let max_perceptual_weight = ((0.1 / 255.) * temp.iter().map(|t| f64::from(t.weight)).sum::<f64>()) as f32;
+        let max_perceptual_weight = ((0.1 / 255.) * temp.iter().map(|t| f64::from(t.weight())).sum::<f64>()) as f32;
 
+        // The 16-bit table is large, so build it lazily only when a 16-bit color is present
         let lut = gamma_lut(gamma);
+        let mut lut16 = None;
         let mut total_perceptual_weight = 0.;
         for temp_item in temp {
-            let cluster = &mut clusters[temp_item.cluster_index as usize];
+            let cluster = &mut clusters[temp_item.cluster_index() as usize];
             let next_index = cluster.end as usize;
             cluster.end += 1;
 
             // weight == 0 means it's a fixed color
-            let weight = if temp_item.weight > 0. {
-                (temp_item.weight * (1. / 255.)).min(max_perceptual_weight)
+            let item_weight = temp_item.weight();
+            let weight = if item_weight > 0. {
+                (item_weight * (1. / 255.)).min(max_perceptual_weight)
             } else {
                 max_perceptual_weight * 16.
             };
             total_perceptual_weight += f64::from(weight);
 
-            items[next_index].color = f_pixel::from_rgba(&lut, temp_item.color);
+            items[next_index].color = match temp_item {
+                TempHistItem::Bit8 { color, .. } => f_pixel::from_rgba(&lut, color),
+                TempHistItem::Bit16 { color, .. } => {
+                    let lut16 = lut16.get_or_insert_with(|| gamma_lut16(gamma));
+                    f_pixel::from_rgba16(lut16, color)
+                },
+            };
             items[next_index].perceptual_weight = weight;
             items[next_index].adjusted_weight = weight;
         }
@@ -354,10 +438,39 @@ impl Histogram {
 }
 
 #[derive(Copy, Clone)]
-struct TempHistItem {
-    color: RGBA,
-    weight: f32,
-    cluster_index: u8,
+enum TempHistItem {
+    Bit8 {
+        color: RGBA,
+        weight: f32,
+        cluster_index: u8,
+    },
+    Bit16 {
+        color: RGBA16,
+        weight: f32,
+        cluster_index: u8,
+    },
+}
+
+impl TempHistItem {
+    #[inline(always)]
+    const fn weight(&self) -> f32 {
+        match self {
+            Self::Bit8 { weight, .. } | Self::Bit16 { weight, .. } => *weight,
+        }
+    }
+
+    #[inline(always)]
+    const fn cluster_index(&self) -> u8 {
+        match self {
+            Self::Bit8 { cluster_index, .. } | Self::Bit16 { cluster_index, .. } => *cluster_index,
+        }
+    }
+}
+
+/// Packs four 16-bit channels into a platform-independent u64 key.
+#[inline(always)]
+pub(crate) fn rgba16_key(px: RGBA16) -> u64 {
+    (u64::from(px.r)) | (u64::from(px.g) << 16) | (u64::from(px.b) << 32) | (u64::from(px.a) << 48)
 }
 
 #[repr(C)]
@@ -400,11 +513,15 @@ impl hash::Hasher for U32Hasher {
     fn finish(&self) -> u64 { u64::from(self.0).wrapping_mul(0x517cc1b727220a95) }
     #[inline(always)]
     fn write_u32(&mut self, i: u32) { self.0 = i; }
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        // fold the high and low words so 16-bit RGBA keys (four u16 channels) hash well
+        self.0 = (i as u32) ^ ((i >> 32) as u32).rotate_left(13);
+    }
 
     fn write(&mut self, _bytes: &[u8]) { unimplemented!() }
     fn write_u8(&mut self, _i: u8) { unimplemented!() }
     fn write_u16(&mut self, _i: u16) { unimplemented!() }
-    fn write_u64(&mut self, _i: u64) { unimplemented!() }
     fn write_u128(&mut self, _i: u128) { unimplemented!() }
     fn write_usize(&mut self, _i: usize) { unimplemented!() }
     fn write_i8(&mut self, _i: i8) { unimplemented!() }
@@ -432,4 +549,40 @@ impl Hash for HashColor {
 }
 
 impl Eq for HashColor {
+}
+
+#[cfg(test)]
+mod rgba16_key_tests {
+    use super::rgba16_key;
+    use crate::RGBA16;
+
+    #[test]
+    fn key_packs_all_channels() {
+        let px = RGBA16::new(0x1111, 0x2222, 0x3333, 0x4444);
+        let key = rgba16_key(px);
+        assert_eq!(key & 0xffff, 0x1111, "r channel");
+        assert_eq!((key >> 16) & 0xffff, 0x2222, "g channel");
+        assert_eq!((key >> 32) & 0xffff, 0x3333, "b channel");
+        assert_eq!((key >> 48) & 0xffff, 0x4444, "a channel");
+    }
+
+    #[test]
+    fn key_is_distinct_and_order_independent() {
+        // different colors must not collide in the low bits used by U32Hasher
+        let a = rgba16_key(RGBA16::new(1, 2, 3, 65535));
+        let b = rgba16_key(RGBA16::new(3, 2, 1, 65535));
+        assert_ne!(a, b);
+        assert_ne!(a as u32, b as u32, "low-word fold must distinguish r/b swaps");
+    }
+
+    #[test]
+    fn grid_aligned_key_roundtrips() {
+        // v16 = v8 * 257 maps back to v8 via integer division (PNG 16->8 convention)
+        for v8 in [0u8, 1, 128, 200, 255] {
+            let v16 = v16_scale(v8);
+            assert_eq!((v16 / 257) as u8, v8);
+        }
+    }
+
+    fn v16_scale(v8: u8) -> u16 { (v8 as u16) * 257 }
 }
