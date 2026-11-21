@@ -247,6 +247,24 @@ Returns `LIQ_VALUE_OUT_OF_RANGE` if the dithering level is outside the 0-1 range
 
 ----
 
+    liq_error liq_set_dithering_mode(liq_result *res, liq_dithering_mode mode);
+
+Selects the dithering algorithm used by `liq_write_remapped_image()`. The default is `LIQ_DITHERING_FLOYD_STEINBERG`.
+
+`LIQ_DITHERING_ORDERED` uses ordered dithering with a Bayer matrix. The output for each pixel depends only on the pixel's position and color, so areas that don't change between frames (of a GIF or a palette PNG sequence) get the same palette indices in every frame and don't flicker. The result also doesn't depend on how the image is split between threads. To keep that guarantee, the palette is not refined during remapping in this mode, so all frames use the same palette.
+
+The dithering level from `liq_set_dithering_level()` and the automatic edge/noise dither map apply to ordered dithering as well. When the image has a background set with `liq_image_set_background()`, pixels that the background reproduces well are still written as the transparent index.
+
+Returns `LIQ_VALUE_OUT_OF_RANGE` if the mode is unknown.
+
+----
+
+    liq_dithering_mode liq_get_dithering_mode(const liq_result *res);
+
+Returns the mode set with `liq_set_dithering_mode()`. `LIQ_DITHERING_FLOYD_STEINBERG` is `0`, `LIQ_DITHERING_ORDERED` is `1`.
+
+----
+
     liq_error liq_write_remapped_image(liq_result *result, liq_image *input_image, void *buffer, size_t buffer_size);
 
 Remaps the image to palette and writes its pixels to the given buffer, 1 pixel per byte.

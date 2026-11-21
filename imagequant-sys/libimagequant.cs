@@ -32,6 +32,13 @@ enum liq_error
     LIQ_BITMAP_NOT_AVAILABLE,
     LIQ_BUFFER_TOO_SMALL,
     LIQ_INVALID_POINTER,
+    LIQ_UNSUPPORTED,
+};
+
+enum liq_dithering_mode
+{
+    LIQ_DITHERING_FLOYD_STEINBERG = 0,
+    LIQ_DITHERING_ORDERED = 1,
 };
 
 namespace liq
@@ -94,6 +101,10 @@ namespace liq
 
         [DllImport(@"imagequant.dll")]
         public static extern liq_error liq_set_dithering_level(liq_result_ptr res, float dither_level);
+        [DllImport(@"imagequant.dll")]
+        public static extern liq_error liq_set_dithering_mode(liq_result_ptr res, liq_dithering_mode mode);
+        [DllImport(@"imagequant.dll")]
+        public static extern liq_dithering_mode liq_get_dithering_mode(liq_result_ptr res);
         [DllImport(@"imagequant.dll")]
         public static extern liq_error liq_set_output_gamma(liq_result_ptr res, double gamma);
         [DllImport(@"imagequant.dll")]

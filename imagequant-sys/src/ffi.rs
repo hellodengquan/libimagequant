@@ -497,6 +497,37 @@ pub extern "C" fn liq_set_dithering_level(result: &mut liq_result, dither_level:
     result.inner.set_dithering_level(dither_level).err().unwrap_or(LIQ_OK)
 }
 
+/// Same values as [`DitheringMode`]
+pub type liq_dithering_mode = c_int;
+
+/// Error diffusion (the default)
+pub const LIQ_DITHERING_FLOYD_STEINBERG: liq_dithering_mode = 0;
+/// Position-based ordered (Bayer) dithering, which is stable between frames of an animation
+pub const LIQ_DITHERING_ORDERED: liq_dithering_mode = 1;
+
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn liq_set_dithering_mode(result: &mut liq_result, mode: liq_dithering_mode) -> liq_error {
+    if bad_object!(result, LIQ_RESULT_MAGIC) { return Error::InvalidPointer; }
+    let mode = match mode {
+        LIQ_DITHERING_FLOYD_STEINBERG => DitheringMode::FloydSteinberg,
+        LIQ_DITHERING_ORDERED => DitheringMode::Ordered,
+        _ => return Error::ValueOutOfRange,
+    };
+    result.inner.set_dithering_mode(mode).err().unwrap_or(LIQ_OK)
+}
+
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn liq_get_dithering_mode(result: &liq_result) -> liq_dithering_mode {
+    if bad_object!(result, LIQ_RESULT_MAGIC) { return -1; }
+    match result.inner.dithering_mode() {
+        DitheringMode::FloydSteinberg => LIQ_DITHERING_FLOYD_STEINBERG,
+        DitheringMode::Ordered => LIQ_DITHERING_ORDERED,
+        _ => -1,
+    }
+}
+
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn liq_get_output_gamma(result: &liq_result) -> f64 {
@@ -762,6 +793,8 @@ fn link_every_symbol() {
         + liq_image_quantize as *const c_void as usize
         + liq_result_from_palette as *const c_void as usize
         + liq_set_dithering_level as *const c_void as usize
+        + liq_set_dithering_mode as *const c_void as usize
+        + liq_get_dithering_mode as *const c_void as usize
         + liq_set_output_gamma as *const c_void as usize
         + liq_get_output_gamma as *const c_void as usize
         + liq_get_palette as *const c_void as usize

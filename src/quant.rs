@@ -6,7 +6,7 @@ use crate::kmeans::Kmeans;
 use crate::mediancut::mediancut;
 use crate::pal::{PalF, PalIndexRemap, PalLen, PalPop, Palette, MAX_COLORS, RGBA};
 use crate::pal::{internal_mse_to_standard_mse, unit_mse_to_internal_mse};
-use crate::remap::{remap_to_palette, remap_to_palette_floyd, DitherMapMode, Remapped};
+use crate::remap::{remap_to_palette, remap_to_palette_floyd, remap_to_palette_ordered, DitherMapMode, DitheringMode, Remapped};
 use crate::seacow::RowBitmapMut;
 use crate::OrdFloat;
 use arrayvec::ArrayVec;
@@ -29,6 +29,7 @@ pub struct QuantizationResult {
     pub(crate) min_posterization_output: u8,
     pub(crate) use_dither_map: DitherMapMode,
     pub(crate) single_threaded_dithering: bool,
+    pub(crate) dithering_mode: DitheringMode,
 }
 
 impl QuantizationResult {
@@ -71,6 +72,7 @@ impl QuantizationResult {
             },
             dither_level: 1.,
             single_threaded_dithering: attr.single_threaded_dithering,
+            dithering_mode: DitheringMode::default(),
         })
     }
 
@@ -79,7 +81,8 @@ impl QuantizationResult {
     #[doc(hidden)]
     pub fn optionally_prepare_for_dithering_with_background_set(&mut self, image: &mut Image<'_>, output_buf: &mut [MaybeUninit<PalIndexRemap>]) -> Result<(), Error> {
         let mut output_pixels = RowBitmapMut::new_contiguous(output_buf, image.width());
-        Self::optionally_generate_dither_map(self.use_dither_map, image, true, &mut output_pixels, &mut self.palette)?;
+        let refine_palette = self.dithering_mode != DitheringMode::Ordered;
+        Self::optionally_generate_dither_map(self.use_dither_map, image, true, &mut output_pixels, &mut self.palette, refine_palette)?;
         Ok(())
     }
 
@@ -102,7 +105,12 @@ impl QuantizationResult {
             remapped.palette_error = Some(remap_to_palette(&mut image.px, image.background.as_deref_mut(), image.importance_map.as_deref(), &mut output_pixels, &mut palette)?.0);
         } else {
             let uses_background = image.background.is_some();
-            let dither_map_error = Self::optionally_generate_dither_map(self.use_dither_map, image, uses_background, &mut output_pixels, &mut palette)?;
+            // Ordered dithering promises that static pixels get identical indices in every frame,
+            // which requires the palette to be identical too. The palette refinement that
+            // `remap_to_palette()` does depends on the image's pixels, so for ordered dithering
+            // the dither map is generated with a throwaway palette copy.
+            let refine_palette = self.dithering_mode != DitheringMode::Ordered;
+            let dither_map_error = Self::optionally_generate_dither_map(self.use_dither_map, image, uses_background, &mut output_pixels, &mut palette, refine_palette)?;
             if self.remap_progress(progress_stage1 as f32 * 0.5) {
                 return Err(Error::Aborted);
             }
@@ -114,13 +122,16 @@ impl QuantizationResult {
             palette.init_int_palette(&mut remapped.int_palette, self.gamma, self.min_posterization_output);
             remapped.palette_error = palette_error;
             let max_dither_error = (palette_error.unwrap_or(quality_to_mse(80)) * 2.4).max(quality_to_mse(35)) as f32;
-            remap_to_palette_floyd(image, output_pixels, &palette, self, max_dither_error, output_image_is_remapped)?;
+            match self.dithering_mode {
+                DitheringMode::FloydSteinberg => remap_to_palette_floyd(image, output_pixels, &palette, self, max_dither_error, output_image_is_remapped)?,
+                DitheringMode::Ordered => remap_to_palette_ordered(image, output_pixels, &palette, self)?,
+            }
         }
         self.remapped = Some(remapped);
         Ok(())
     }
 
-    fn optionally_generate_dither_map(use_dither_map: DitherMapMode, image: &mut Image<'_>, uses_background: bool, output_pixels: &mut RowBitmapMut<'_, MaybeUninit<PalIndexRemap>>, palette: &mut PalF) -> Result<Option<f64>, Error> {
+    fn optionally_generate_dither_map(use_dither_map: DitherMapMode, image: &mut Image<'_>, uses_background: bool, output_pixels: &mut RowBitmapMut<'_, MaybeUninit<PalIndexRemap>>, palette: &mut PalF, refine_palette: bool) -> Result<Option<f64>, Error> {
         let is_image_huge = (image.px.width * image.px.height) > 2000 * 2000;
         let allow_dither_map = use_dither_map == DitherMapMode::Always || (!is_image_huge && use_dither_map != DitherMapMode::None);
         let generate_dither_map = allow_dither_map && image.dither_map.is_none();
@@ -129,6 +140,15 @@ impl QuantizationResult {
         }
 
         // If dithering (with dither map) is required, this image is used to find areas that require dithering
+        let mut scratch_palette;
+        let palette = if refine_palette {
+            palette
+        } else {
+            // For ordered dithering the real palette must stay untouched, so that the same palette
+            // (and therefore the same indices for static pixels) is used for every frame.
+            scratch_palette = palette.clone();
+            &mut scratch_palette
+        };
         let (palette_error, row_pointers_remapped) = remap_to_palette(&mut image.px, None, image.importance_map.as_deref(), output_pixels, palette)?;
         image.update_dither_map(&row_pointers_remapped, &*palette, uses_background)?;
         Ok(Some(palette_error))
@@ -321,6 +341,29 @@ impl QuantizationResult {
     pub fn dithering_level(&self) -> f32 {
         self.dither_level
     }
+
+    /// Choose the dithering algorithm used by [`Self::remapped()`] and [`Self::remap_into()`].
+    ///
+    /// The default is [`DitheringMode::FloydSteinberg`].
+    ///
+    /// [`DitheringMode::Ordered`] makes the output for a pixel depend only on the pixel's position
+    /// and color, so areas that don't change between frames of an animation get identical palette
+    /// indices in every frame and don't flicker. To guarantee that, the palette refinement normally
+    /// done while generating an automatic dither map is skipped in this mode, so the palette stays
+    /// the same for every remapped frame. The dithering level and the dither map still apply.
+    ///
+    /// The mode doesn't affect the palette itself, only remapping.
+    pub fn set_dithering_mode(&mut self, mode: DitheringMode) -> Result<(), Error> {
+        self.remapped = None;
+        self.dithering_mode = mode;
+        Ok(())
+    }
+
+    /// Getter for the value set in [`Self::set_dithering_mode`]
+    #[must_use]
+    pub fn dithering_mode(&self) -> DitheringMode {
+        self.dithering_mode
+    }
 }
 
 impl Clone for QuantizationResult {
@@ -337,6 +380,7 @@ impl Clone for QuantizationResult {
             min_posterization_output: self.min_posterization_output,
             use_dither_map: self.use_dither_map,
             single_threaded_dithering: self.single_threaded_dithering,
+            dithering_mode: self.dithering_mode,
         }
     }
 }

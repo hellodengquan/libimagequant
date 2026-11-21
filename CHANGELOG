@@ -1,3 +1,8 @@
+version 4.5
+-----------
+ - ordered (Bayer) dithering mode, which keeps static areas stable between frames of animations
+ - `QuantizationResult::set_dithering_mode()` and the C API's `liq_set_dithering_mode()`
+
 version 4.4
 -----------
  - palette quality improvements

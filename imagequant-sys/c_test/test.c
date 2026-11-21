@@ -164,10 +164,70 @@ static void test_fixed_colors_order() {
     liq_attr_destroy(attr);
 }
 
+static void test_dithering_mode() {
+    liq_attr *attr = liq_attr_create();
+    assert(attr);
+    assert(LIQ_OK == liq_set_max_colors(attr, 4));
+
+    const int width = 16;
+    const int height = 16;
+    unsigned char bitmap[16 * 16 * 4];
+    for(int y = 0; y < height; y++) {
+        for(int x = 0; x < width; x++) {
+            unsigned char *px = bitmap + (y * width + x) * 4;
+            px[0] = (unsigned char)(x * 3);
+            px[1] = (unsigned char)(y * 5);
+            px[2] = 128;
+            px[3] = 255;
+        }
+    }
+
+    liq_image *img = liq_image_create_rgba(attr, bitmap, width, height, 0);
+    assert(img);
+
+    liq_result *res;
+    assert(LIQ_OK == liq_image_quantize(img, attr, &res));
+    assert(res);
+
+    // Floyd-Steinberg is the default
+    assert(LIQ_DITHERING_FLOYD_STEINBERG == liq_get_dithering_mode(res));
+
+    assert(LIQ_OK == liq_set_dithering_level(res, 1.0));
+
+    unsigned char buf1[16 * 16];
+    assert(LIQ_OK == liq_write_remapped_image(res, img, buf1, sizeof(buf1)));
+
+    assert(LIQ_OK == liq_set_dithering_mode(res, LIQ_DITHERING_ORDERED));
+    assert(LIQ_DITHERING_ORDERED == liq_get_dithering_mode(res));
+
+    unsigned char buf2[16 * 16];
+    assert(LIQ_OK == liq_write_remapped_image(res, img, buf2, sizeof(buf2)));
+
+    // Ordered dithering is deterministic regardless of how the image is split into chunks
+    unsigned char buf3[16 * 16];
+    assert(LIQ_OK == liq_write_remapped_image(res, img, buf3, sizeof(buf3)));
+    assert(0 == memcmp(buf2, buf3, sizeof(buf2)));
+
+    // Dithering level 0 gives the same result as without dithering, whatever the mode
+    assert(LIQ_OK == liq_set_dithering_level(res, 0.0));
+    assert(LIQ_OK == liq_write_remapped_image(res, img, buf2, sizeof(buf2)));
+    assert(LIQ_OK == liq_set_dithering_mode(res, LIQ_DITHERING_FLOYD_STEINBERG));
+    assert(LIQ_OK == liq_write_remapped_image(res, img, buf3, sizeof(buf3)));
+    assert(0 == memcmp(buf2, buf3, sizeof(buf2)));
+
+    // Unknown modes are rejected
+    assert(LIQ_VALUE_OUT_OF_RANGE == liq_set_dithering_mode(res, (liq_dithering_mode)42));
+
+    liq_result_destroy(res);
+    liq_image_destroy(img);
+    liq_attr_destroy(attr);
+}
+
 void run_liq_tests() {
     test_fixed_colors();
     test_fixed_colors_order();
     test_abort();
     test_histogram();
     test_zero_histogram();
+    test_dithering_mode();
 }

@@ -127,6 +127,16 @@ LIQ_EXPORT liq_error liq_set_dithering_level(liq_result *res, float dither_level
 LIQ_EXPORT liq_error liq_set_output_gamma(liq_result* res, double gamma) LIQ_NONNULL;
 LIQ_EXPORT LIQ_USERESULT double liq_get_output_gamma(const liq_result *result) LIQ_NONNULL;
 
+typedef enum liq_dithering_mode {
+    /* Floyd-Steinberg error diffusion (the default). */
+    LIQ_DITHERING_FLOYD_STEINBERG = 0,
+    /* Ordered (Bayer) dithering. The output for a pixel depends only on its position and color, so static areas of animations don't flicker. */
+    LIQ_DITHERING_ORDERED = 1,
+} liq_dithering_mode;
+
+LIQ_EXPORT liq_error liq_set_dithering_mode(liq_result *res, liq_dithering_mode mode) LIQ_NONNULL;
+LIQ_EXPORT LIQ_USERESULT liq_dithering_mode liq_get_dithering_mode(const liq_result *res) LIQ_NONNULL;
+
 LIQ_EXPORT LIQ_USERESULT const liq_palette *liq_get_palette(liq_result *result) LIQ_NONNULL;
 
 LIQ_EXPORT liq_error liq_write_remapped_image(liq_result *result, liq_image *input_image, void *buffer, size_t buffer_size) LIQ_NONNULL;

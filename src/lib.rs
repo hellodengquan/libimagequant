@@ -69,6 +69,7 @@ pub use image::Image;
 pub use pal::Palette;
 pub use pal::RGBA;
 pub use quant::QuantizationResult;
+pub use remap::DitheringMode;
 
 #[doc(hidden)]
 #[deprecated(note = "Please use the imagequant::Error type. This will be removed")]

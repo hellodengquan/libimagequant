@@ -62,6 +62,21 @@ impl Nearest<'_> {
         vp_search_node(&self.root, px, &mut best_candidate);
         (best_candidate.idx, best_candidate.distance_squared)
     }
+
+    /// Like [`Self::search()`], but finds the nearest color other than `exclude`.
+    ///
+    /// Returns `(exclude, f32::INFINITY)` if the palette has no other colors.
+    #[inline]
+    pub(crate) fn search_excluding(&self, px: &f_pixel, exclude: PalIndex) -> (PalIndex, f32) {
+        let mut best_candidate = Visitor {
+            distance: f32::INFINITY,
+            distance_squared: f32::INFINITY,
+            idx: exclude,
+            exclude: Some(exclude),
+        };
+        vp_search_node(&self.root, px, &mut best_candidate);
+        (best_candidate.idx, best_candidate.distance_squared)
+    }
 }
 
 pub(crate) struct Nearest<'pal> {
