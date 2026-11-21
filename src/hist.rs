@@ -5,16 +5,15 @@ use crate::quant::QuantizationResult;
 use crate::rows::{temp_buf, DynamicRows};
 use crate::Attributes;
 use core::{fmt, hash, mem};
-use core::hash::Hash;
 
 #[cfg(all(not(feature = "std"), feature = "no_std"))]
 use std::{format, boxed::Box, vec::Vec};
 
 #[cfg(all(not(feature = "std"), feature = "no_std"))]
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 
 #[cfg(not(all(not(feature = "std"), feature = "no_std")))]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 
 /// Number of pixels in a given color for [`Histogram::add_colors()`]
@@ -34,7 +33,10 @@ pub struct HistogramEntry {
 /// If you're converting one image at a time, see [`Attributes::new_image`] instead
 pub struct Histogram {
     gamma: Option<f64>,
-    fixed_colors: FixedColorsSet,
+    /// Fixed colors in the order they were added. Deduplicated by RGBA, keeping the first occurrence.
+    ///
+    /// The order is significant: it defines the order of the fixed prefix of the output palette.
+    fixed_colors: Vec<RGBA>,
 
     /// The key is the RGBA cast to u32
     /// The value is a (boosted) count or 0 if it's a fixed color
@@ -43,8 +45,6 @@ pub struct Histogram {
     posterize_bits: u8,
     max_histogram_entries: u32,
 }
-
-pub(crate) type FixedColorsSet = HashSet<HashColor, U32Hasher>;
 
 #[derive(Clone)]
 pub(crate) struct HistItem {
@@ -94,7 +94,7 @@ impl Histogram {
         Self {
             posterize_bits: attr.posterize_bits(),
             max_histogram_entries: attr.max_histogram_entries,
-            fixed_colors: HashSet::with_hasher(U32Hasher(0)),
+            fixed_colors: Vec::new(),
             hashmap: HashMap::with_hasher(U32Hasher(0)),
             gamma: None,
         }
@@ -115,9 +115,9 @@ impl Histogram {
         self.gamma = image.gamma();
 
         if !image.fixed_colors.is_empty() {
-            self.fixed_colors.extend(image.fixed_colors.iter().copied().enumerate().map(|(idx, rgba)| {
-               HashColor { rgba, index: idx as _ }
-            }));
+            for &rgba in &image.fixed_colors {
+                self.push_fixed_color(rgba)?;
+            }
         }
 
         if attr.progress(f32::from(attr.progress_stage1) * 0.40) {
@@ -164,19 +164,28 @@ impl Histogram {
 
     /// Add a color guaranteed to be in the final palette
     ///
+    /// Colors are kept in the order they are added, and appear in the same order at the start of the
+    /// output palette, with their RGBA values unchanged.
+    ///
     /// The gamma may be 0 to mean sRGB. All calls to `add_colors` and `add_fixed_color` should use the same gamma value.
     pub fn add_fixed_color(&mut self, rgba: RGBA, gamma: f64) -> Result<(), Error> {
-        if self.fixed_colors.len() >= MAX_COLORS {
-            return Err(Unsupported);
-        }
-
         if self.gamma.is_none() && gamma > 0. {
             self.gamma = Some(gamma);
         }
 
-        let idx = self.fixed_colors.len();
-        self.fixed_colors.insert(HashColor { rgba, index: idx as _ });
+        self.push_fixed_color(rgba)
+    }
 
+    /// Adds the color keeping the original order, ignoring exact duplicates.
+    fn push_fixed_color(&mut self, rgba: RGBA) -> Result<(), Error> {
+        if self.fixed_colors.contains(&rgba) {
+            return Ok(());
+        }
+        if self.fixed_colors.len() >= MAX_COLORS {
+            return Err(Unsupported);
+        }
+        self.fixed_colors.try_reserve(1)?;
+        self.fixed_colors.push(rgba);
         Ok(())
     }
 
@@ -281,7 +290,7 @@ impl Histogram {
 
         // Fixed colors will be put into normal hashmap, but with very high weight,
         // and temporarily 0 means this fixed max weight
-        for &HashColor { rgba, .. } in &self.fixed_colors {
+        for &rgba in &self.fixed_colors {
             let px_int = if rgba.a != 0 {
                 unsafe { RGBAInt { rgba }.int }
             } else { 0 };
@@ -345,9 +354,9 @@ impl Histogram {
             items[next_index].adjusted_weight = weight;
         }
 
-        let mut fixed_colors: Vec<_> = self.fixed_colors.iter().collect();
-        fixed_colors.sort_by_key(|c| c.index); // original order
-        let fixed_colors = fixed_colors.iter().map(|c| f_pixel::from_rgba(&lut, c.rgba)).collect();
+        let fixed_colors = self.fixed_colors.iter().copied()
+            .map(|rgba| (f_pixel::from_rgba(&lut, rgba), rgba))
+            .collect();
 
         Ok(HistogramInternal { items, total_perceptual_weight, clusters, fixed_colors })
     }
@@ -373,7 +382,8 @@ pub(crate) struct HistogramInternal {
     pub items: Box<[HistItem]>,
     pub total_perceptual_weight: f64,
     pub clusters: [Cluster; LIQ_MAXCLUSTER],
-    pub fixed_colors: Box<[f_pixel]>,
+    /// Fixed colors in the order they were added, with their original RGBA values
+    pub fixed_colors: Box<[(f_pixel, RGBA)]>,
 }
 
 // Pre-grouped colors
@@ -415,21 +425,3 @@ impl hash::Hasher for U32Hasher {
     fn write_isize(&mut self, _i: isize) { unimplemented!() }
 }
 
-/// ignores the index
-#[derive(PartialEq, Debug)]
-pub(crate) struct HashColor {
-    pub rgba: RGBA,
-    pub index: PalIndex,
-}
-
-#[allow(clippy::derived_hash_with_manual_eq)]
-impl Hash for HashColor {
-    #[inline]
-    fn hash<H: hash::Hasher>(&self, state: &mut H) {
-        let s: &[u8] = self.rgba.as_ref();
-        u32::from_ne_bytes(s.try_into().unwrap()).hash(state);
-    }
-}
-
-impl Eq for HashColor {
-}

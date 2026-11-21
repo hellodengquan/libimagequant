@@ -358,6 +358,174 @@ fn test_fixed_colors() {
     }
 }
 
+/// Gradient image used by the fixed-palette tests
+#[cfg(test)]
+fn gradient_image(liq: &Attributes) -> Image<'static> {
+    let pixels: Vec<_> = (0..64 * 64).map(|n| {
+        RGBA::new((n % 256) as u8, ((n / 3) % 256) as u8, ((n / 7) % 256) as u8, 255)
+    }).collect();
+    liq.new_image(pixels, 64, 64, 0.).unwrap()
+}
+
+#[cfg(test)]
+fn assert_fixed_prefix(pal: &[RGBA], fixed: &[RGBA]) {
+    assert!(pal.len() >= fixed.len(), "palette is too short: {} < {}", pal.len(), fixed.len());
+    assert_eq!(&pal[..fixed.len()], fixed);
+}
+
+#[test]
+fn fixed_colors_keep_exact_values_and_order() {
+    let mut attr = Attributes::new();
+    attr.set_max_colors(64).unwrap();
+    // arbitrary values that posterization would otherwise round
+    let fixed = [
+        RGBA::new(1, 2, 3, 255),
+        RGBA::new(17, 130, 201, 255),
+        RGBA::new(255, 0, 128, 255),
+    ];
+
+    for posterize in [0, 1, 2, 3] {
+        attr.set_min_posterization(posterize).unwrap();
+        let mut img = gradient_image(&attr);
+        for &c in &fixed {
+            img.add_fixed_color(c).unwrap();
+        }
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(0.).unwrap();
+        assert_fixed_prefix(res.palette(), &fixed);
+        // also after remapping, which finalizes the palette
+        let (pal, _) = res.remapped(&mut img).unwrap();
+        assert_fixed_prefix(&pal, &fixed);
+    }
+}
+
+#[test]
+fn fixed_colors_keep_transparent_color_key_rgb() {
+    let mut attr = Attributes::new();
+    attr.set_max_colors(64).unwrap();
+    let fixed = [
+        RGBA::new(12, 34, 56, 0),   // transparent color key with meaningful RGB
+        RGBA::new(200, 100, 50, 255),
+    ];
+    let mut img = gradient_image(&attr);
+    for &c in &fixed {
+        img.add_fixed_color(c).unwrap();
+    }
+    let mut res = attr.quantize(&mut img).unwrap();
+    res.set_dithering_level(0.).unwrap();
+    let (pal, _) = res.remapped(&mut img).unwrap();
+    assert_eq!(&pal[..fixed.len()], &fixed);
+}
+
+#[test]
+fn fixed_colors_mixed_with_free_colors() {
+    let mut attr = Attributes::new();
+    attr.set_quality(0, 100).unwrap();
+    attr.set_max_colors(16).unwrap();
+    let fixed = [
+        RGBA::new(9, 87, 165, 255),
+        RGBA::new(250, 250, 0, 255),
+    ];
+    let mut img = gradient_image(&attr);
+    for &c in &fixed {
+        img.add_fixed_color(c).unwrap();
+    }
+    let mut res = attr.quantize(&mut img).unwrap();
+    res.set_dithering_level(1.).unwrap();
+    let (pal, idx) = res.remapped(&mut img).unwrap();
+
+    assert_fixed_prefix(&pal, &fixed);
+    assert!(pal.len() <= 16);
+    // free colors follow the fixed prefix
+    assert!(pal.len() > fixed.len());
+    assert!(idx.iter().all(|&i| (i as usize) < pal.len()));
+}
+
+#[test]
+fn fixed_colors_same_for_all_entry_points() {
+    let fixed = [
+        RGBA::new(3, 7, 11, 255),
+        RGBA::new(101, 202, 33, 255),
+        RGBA::new(77, 66, 55, 128),
+    ];
+
+    let mut attr = Attributes::new();
+    attr.set_speed(7).unwrap();
+
+    let mut hist = Histogram::new(&attr);
+    for &c in &fixed {
+        hist.add_fixed_color(c, 0.).unwrap();
+    }
+    // colors also present in the image must not disturb the fixed prefix order
+    let mut hist = {
+        let mut img = gradient_image(&attr);
+        hist.add_image(&attr, &mut img).unwrap();
+        hist
+    };
+    let mut via_hist = hist.quantize(&attr).unwrap();
+    let via_hist_pal = via_hist.palette_vec();
+
+    let mut via_palette = QuantizationResult::from_palette(&attr, &fixed, 0.).unwrap();
+    let via_palette_pal = via_palette.palette_vec();
+
+    let mut attr2 = Attributes::new();
+    attr2.set_speed(7).unwrap();
+    let mut img = gradient_image(&attr2);
+    for &c in &fixed {
+        img.add_fixed_color(c).unwrap();
+    }
+    let mut via_image = attr2.quantize(&mut img).unwrap();
+    let via_image_pal = via_image.palette_vec();
+
+    assert_fixed_prefix(&via_hist_pal, &fixed);
+    assert_fixed_prefix(&via_palette_pal, &fixed);
+    assert_fixed_prefix(&via_image_pal, &fixed);
+    // direct palette construction produces exactly the fixed colors
+    assert_eq!(via_palette_pal, &fixed);
+
+    // A histogram built from the very same image must give exactly the same palette as
+    // the single-image entry point, including the fixed prefix.
+    assert_eq!(via_hist_pal, via_image_pal);
+}
+
+#[test]
+fn fixed_colors_are_deduplicated_keeping_order() {
+    let attr = Attributes::new();
+    let mut hist = Histogram::new(&attr);
+    let tmp = (0..64).map(|c| HistogramEntry {
+        color: RGBA::new(c, c, c, 255),
+        count: 1,
+    }).collect::<Vec<_>>();
+    hist.add_colors(&tmp, 0.).unwrap();
+    hist.add_fixed_color(RGBA::new(5, 5, 5, 255), 0.).unwrap();
+    hist.add_fixed_color(RGBA::new(200, 1, 2, 255), 0.).unwrap();
+    hist.add_fixed_color(RGBA::new(5, 5, 5, 255), 0.).unwrap(); // duplicate
+    let mut res = hist.quantize(&attr).unwrap();
+    let pal = res.palette();
+    assert_eq!(&pal[..2], &[RGBA::new(5, 5, 5, 255), RGBA::new(200, 1, 2, 255)]);
+    // the duplicate must not create an extra palette entry
+    assert_eq!(pal.iter().filter(|&&c| c == RGBA::new(200, 1, 2, 255)).count(), 1);
+}
+
+#[test]
+fn fixed_colors_with_last_index_transparent() {
+    let mut attr = Attributes::new();
+    attr.set_max_colors(64).unwrap();
+    attr.set_last_index_transparent(true);
+    let fixed = [
+        RGBA::new(10, 20, 30, 255),
+        RGBA::new(40, 50, 60, 255),
+    ];
+    let mut img = gradient_image(&attr);
+    for &c in &fixed {
+        img.add_fixed_color(c).unwrap();
+    }
+    let mut res = attr.quantize(&mut img).unwrap();
+    res.set_dithering_level(0.).unwrap();
+    let (pal, _) = res.remapped(&mut img).unwrap();
+    assert_fixed_prefix(&pal, &fixed);
+}
+
 #[cfg(all(not(feature = "std"), feature = "no_std"))]
 pub(crate) mod no_std_compat {
     pub use std::boxed::Box;

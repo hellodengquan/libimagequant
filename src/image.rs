@@ -208,11 +208,16 @@ impl<'pixels> Image<'pixels> {
     ///
     /// It must be called before the image is quantized.
     ///
+    /// Fixed colors are kept in the order they were added, and appear in the same order at the start of the
+    /// output palette. Their RGBA values are not modified (not even by posterization).
+    ///
     /// Returns error if more than 256 colors are added. If image is quantized to fewer colors than the number of fixed colors added, then excess fixed colors will be ignored.
     pub fn add_fixed_color(&mut self, color: RGBA) -> Result<(), Error> {
         if self.fixed_colors.len() >= MAX_COLORS { return Err(Unsupported); }
-        self.fixed_colors.try_reserve(1)?;
-        self.fixed_colors.push_in_cap(color);
+        if !self.fixed_colors.contains(&color) {
+            self.fixed_colors.try_reserve(1)?;
+            self.fixed_colors.push_in_cap(color);
+        }
         Ok(())
     }
 

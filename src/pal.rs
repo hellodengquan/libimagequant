@@ -1,6 +1,7 @@
 use crate::OrdFloat;
 use arrayvec::ArrayVec;
-use core::iter;
+use core::cmp::Reverse;
+use core::mem;
 use core::ops::{Deref, DerefMut};
 use rgb::prelude::*;
 
@@ -255,6 +256,12 @@ pub(crate) const MAX_COLORS: usize = if PalIndex::MAX == 255 { 256 } else { 2048
 pub(crate) struct PalF {
     colors: ArrayVec<f_pixel, MAX_COLORS>,
     pops: ArrayVec<PalPop, MAX_COLORS>,
+    /// Exact caller-supplied RGBA values of the fixed prefix of the palette.
+    ///
+    /// These entries occupy indices `0..fixed_rgba.len()`, and must be emitted unchanged,
+    /// in this order, because callers interpret palette indices according to their own palette.
+    /// Boxed to keep `PalF` small enough for the stack.
+    fixed_rgba: Box<[RGBA]>,
 }
 
 impl PalF {
@@ -265,7 +272,14 @@ impl PalF {
         Self {
             colors: ArrayVec::default(),
             pops: ArrayVec::default(),
+            fixed_rgba: Box::default(),
         }
+    }
+
+    /// Number of leading palette entries that are fixed and must not be reordered or modified
+    #[inline(always)]
+    pub(crate) fn fixed_len(&self) -> usize {
+        self.fixed_rgba.len()
     }
 
     #[inline(always)]
@@ -296,34 +310,63 @@ impl PalF {
     }
 
     // this is max colors allowed by the user, not just max in the current (candidate/low-quality) palette
-    pub(crate) fn with_fixed_colors(mut self, max_colors: PalLen, fixed_colors: &[f_pixel]) -> Self {
+    pub(crate) fn with_fixed_colors(mut self, max_colors: PalLen, fixed_colors: &[(f_pixel, RGBA)]) -> Self {
         if fixed_colors.is_empty() {
             return self;
         }
 
-        // if using low quality, there's a chance mediancut won't create enough colors in the palette
-        let max_fixed_colors = fixed_colors.len().min(max_colors as usize);
-        if self.len() < max_fixed_colors {
-            let needs_extra = max_fixed_colors - self.len();
-            self.colors.extend(fixed_colors.iter().copied().take(needs_extra));
-            self.pops.extend(iter::repeat(PalPop::new(0.)).take(needs_extra));
-            debug_assert_eq!(self.len(), max_fixed_colors);
+        // The fixed colors must be complete and in their original order at the start of the palette,
+        // because the caller interprets palette indices according to their own palette.
+        // If there are more fixed colors than the requested color limit, the excess tail is ignored,
+        // matching the documented behavior of fixed colors.
+        let fixed_colors = &fixed_colors[..fixed_colors.len().min(max_colors as usize)];
+
+        let colors = mem::take(&mut self.colors);
+        let pops = mem::take(&mut self.pops);
+
+        // Fixed colors are also present in the histogram, so median cut is likely to have picked
+        // entries close to them. Remove one existing entry per fixed color to make room,
+        // and keep the rest as free colors following the fixed prefix.
+        let mut removed = [false; MAX_COLORS];
+        for &(fixed_color, _) in fixed_colors {
+            let best = colors.iter().enumerate()
+                .filter(|&(i, _)| !removed[i])
+                .min_by_key(|&(_, pal_color)| {
+                    // not using Nearest, because creation of the index may take longer than naive search once
+                    OrdFloat::new(pal_color.diff(&fixed_color))
+                })
+                .map(|(i, _)| i);
+            if let Some(best) = best {
+                removed[best] = true;
+            }
         }
 
-        // since the fixed colors were in the histogram, expect them to be in the palette,
-        // and change closest existing one to be exact fixed
-        for (i, fixed_color) in fixed_colors.iter().enumerate().take(self.len()) {
-            let (best_idx, _) = self.colors.iter().enumerate().skip(i).min_by_key(|(_, pal_color)| {
-                // not using Nearest, because creation of the index may take longer than naive search once
-                OrdFloat::new(pal_color.diff(fixed_color))
-            }).expect("logic bug in fixed colors, please report a bug");
-            debug_assert!(best_idx >= i);
-            self.swap(i, best_idx);
-            self.set(i, *fixed_color, self.pops[i].to_fixed());
+        let mut free: ArrayVec<(f_pixel, PalPop), MAX_COLORS> = ArrayVec::new();
+        for (i, (color, pop)) in colors.into_iter().zip(pops).enumerate() {
+            if !removed[i] {
+                free.push((color, pop));
+            }
         }
 
-        debug_assert!(self.colors.iter().zip(fixed_colors).all(|(p, f)| p == f));
-        debug_assert!(self.pops.iter().take(fixed_colors.len()).all(|pop| pop.is_fixed()));
+        // keep the most popular free colors if there's not enough room for all of them
+        let max_free = (max_colors as usize).saturating_sub(fixed_colors.len());
+        if free.len() > max_free {
+            free.sort_unstable_by_key(|&(_, pop)| Reverse(OrdFloat::new(pop.popularity())));
+            free.truncate(max_free);
+        }
+
+        for &(color, _rgba) in fixed_colors {
+            self.colors.push(color);
+            self.pops.push(PalPop::new(0.).to_fixed());
+        }
+        for (color, pop) in free {
+            self.colors.push(color);
+            self.pops.push(pop);
+        }
+        self.fixed_rgba = fixed_colors.iter().map(|&(_, rgba)| rgba).collect();
+
+        debug_assert!(self.colors.len() <= MAX_COLORS);
+        debug_assert_eq!(self.colors.len(), self.pops.len());
         self
     }
 
@@ -349,18 +392,25 @@ impl PalF {
     /// Also rounds the input pal
     pub(crate) fn init_int_palette(&mut self, int_palette: &mut Palette, gamma: f64, posterize: u8) {
         let lut = gamma_lut(gamma);
-        for ((f_color, f_pop), int_pal) in self.iter_mut().zip(&mut int_palette.entries) {
-            let mut px = f_color.to_rgb(gamma)
-                .map(move |c| posterize_channel(c, posterize));
-            *f_color = f_pixel::from_rgba(&lut, px);
+        let len = self.len();
+        for i in 0..len {
+            let f_pop = self.pops[i];
+            // Fixed colors are emitted exactly as given by the caller: their RGB values are meaningful
+            // (e.g. color keys), so neither posterization nor rounding may change them.
+            let mut px = if let Some(&rgba) = self.fixed_rgba.get(i) {
+                rgba
+            } else {
+                self.colors[i].to_rgb(gamma).map(move |c| posterize_channel(c, posterize))
+            };
             if px.a == 0 && !f_pop.is_fixed() {
                 px.r = 71u8;
                 px.g = 112u8;
                 px.b = 76u8;
             }
-            *int_pal = px;
+            self.colors[i] = f_pixel::from_rgba(&lut, px);
+            int_palette.entries[i] = px;
         }
-        int_palette.count = self.len() as _;
+        int_palette.count = len as _;
     }
 }
 

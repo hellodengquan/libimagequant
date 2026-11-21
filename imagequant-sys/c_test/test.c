@@ -164,9 +164,116 @@ static void test_fixed_colors_order() {
     liq_attr_destroy(attr);
 }
 
+static void test_fixed_colors_preserved() {
+    liq_attr *attr = liq_attr_create();
+    assert(attr);
+    // options that must not affect the fixed part of the palette
+    assert(LIQ_OK == liq_set_min_posterization(attr, 2));
+    assert(LIQ_OK == liq_set_quality(attr, 0, 100));
+    assert(LIQ_OK == liq_set_max_colors(attr, 16));
+    assert(LIQ_OK == liq_set_speed(attr, 10));
+
+    unsigned char pixels[64 * 4];
+    for (int i = 0; i < 64; i++) {
+        pixels[i * 4 + 0] = (unsigned char)(i * 4);
+        pixels[i * 4 + 1] = (unsigned char)(i * 2);
+        pixels[i * 4 + 2] = (unsigned char)(i * 3);
+        pixels[i * 4 + 3] = 255;
+    }
+    liq_image *img = liq_image_create_rgba(attr, pixels, 8, 8, 0);
+    assert(img);
+
+    const liq_color fixed[3] = {
+        {1, 2, 3, 255},       // values posterization would round
+        {17, 130, 201, 255},
+        {12, 34, 56, 0},      // transparent color key with meaningful RGB
+    };
+    for (int i = 0; i < 3; i++) {
+        assert(LIQ_OK == liq_image_add_fixed_color(img, fixed[i]));
+    }
+
+    liq_result *res = liq_quantize_image(attr, img);
+    assert(res);
+
+    char buf[64];
+    assert(LIQ_OK == liq_write_remapped_image(res, img, buf, sizeof(buf)));
+
+    const liq_palette *pal = liq_get_palette(res);
+    assert(pal);
+    assert(pal->count >= 3);
+    for (int i = 0; i < 3; i++) {
+        assert(pal->entries[i].r == fixed[i].r);
+        assert(pal->entries[i].g == fixed[i].g);
+        assert(pal->entries[i].b == fixed[i].b);
+        assert(pal->entries[i].a == fixed[i].a);
+    }
+    for (int i = 0; i < 64; i++) {
+        assert((unsigned char)buf[i] < pal->count);
+    }
+
+    liq_result_destroy(res);
+    liq_image_destroy(img);
+    liq_attr_destroy(attr);
+}
+
+static void test_fixed_palette_entry_points_agree() {
+    liq_attr *attr = liq_attr_create();
+    assert(attr);
+    assert(LIQ_OK == liq_set_speed(attr, 8));
+
+    const liq_color fixed[2] = {
+        {9, 87, 165, 255},
+        {250, 250, 0, 255},
+    };
+
+    // via histogram
+    liq_histogram *hist = liq_histogram_create(attr);
+    assert(hist);
+    for (int i = 0; i < 2; i++) {
+        assert(LIQ_OK == liq_histogram_add_fixed_color(hist, fixed[i], 0));
+    }
+    unsigned char pixels[4] = {100, 150, 200, 255};
+    liq_image *img = liq_image_create_rgba(attr, pixels, 1, 1, 0);
+    assert(img);
+    assert(LIQ_OK == liq_histogram_add_image(hist, attr, img));
+
+    liq_result *res;
+    assert(LIQ_OK == liq_histogram_quantize(hist, attr, &res));
+    const liq_palette *pal = liq_get_palette(res);
+    assert(pal);
+    assert(pal->count >= 2);
+    for (int i = 0; i < 2; i++) {
+        assert(pal->entries[i].r == fixed[i].r);
+        assert(pal->entries[i].g == fixed[i].g);
+        assert(pal->entries[i].b == fixed[i].b);
+        assert(pal->entries[i].a == fixed[i].a);
+    }
+    liq_result_destroy(res);
+    liq_histogram_destroy(hist);
+
+    // same palette, built directly
+    liq_result *res2;
+    assert(LIQ_OK == liq_result_from_palette(attr, fixed, 2, 0, &res2));
+    const liq_palette *pal2 = liq_get_palette(res2);
+    assert(pal2);
+    assert(pal2->count == 2);
+    for (int i = 0; i < 2; i++) {
+        assert(pal2->entries[i].r == fixed[i].r);
+        assert(pal2->entries[i].g == fixed[i].g);
+        assert(pal2->entries[i].b == fixed[i].b);
+        assert(pal2->entries[i].a == fixed[i].a);
+    }
+    liq_result_destroy(res2);
+
+    liq_image_destroy(img);
+    liq_attr_destroy(attr);
+}
+
 void run_liq_tests() {
     test_fixed_colors();
     test_fixed_colors_order();
+    test_fixed_colors_preserved();
+    test_fixed_palette_entry_points_agree();
     test_abort();
     test_histogram();
     test_zero_histogram();

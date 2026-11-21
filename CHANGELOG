@@ -1,3 +1,10 @@
+version 4.5
+-----------
+ - fixed palette colors reliably keep their original order and exact RGBA values
+   (including transparent color keys), and are no longer affected by palette sorting,
+   output posterization, or mixing with free quantized colors
+ - fix palette index overflow with the maximum number of colors
+
 version 4.4
 -----------
  - palette quality improvements

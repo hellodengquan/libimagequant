@@ -344,18 +344,25 @@ impl Clone for QuantizationResult {
 fn sort_palette(attr: &Attributes, palette: &mut PalF) {
     let last_index_transparent = attr.last_index_transparent;
 
-    let mut tmp: ArrayVec<_, { MAX_COLORS }> = palette.iter_mut().map(|(c, p)| (*c, *p)).collect();
+    // The caller-supplied fixed colors must keep their original order and indices,
+    // so only the free colors that follow them are sorted.
+    let fixed_len = palette.fixed_len();
+    if fixed_len >= palette.len() {
+        return;
+    }
+
+    let mut tmp: ArrayVec<_, { MAX_COLORS }> = palette.iter_mut().skip(fixed_len).map(|(c, p)| (*c, *p)).collect();
     tmp.sort_by_key(|(color, pop)| {
         let trns = !color.is_fully_opaque();
         (trns == last_index_transparent, Reverse(OrdFloat::new(pop.popularity())))
     });
-    palette.iter_mut().zip(tmp).for_each(|((dcol, dpop), (scol, spop))| {
+    palette.iter_mut().skip(fixed_len).zip(tmp).for_each(|((dcol, dpop), (scol, spop))| {
         *dcol = scol;
         *dpop = spop;
     });
 
     if last_index_transparent {
-        let alpha_index = palette.as_slice().iter().enumerate()
+        let alpha_index = palette.as_slice().iter().enumerate().skip(fixed_len)
             .filter(|(_, c)| !c.is_fully_opaque())
             .min_by_key(|(_, c)| OrdFloat::new(c.a))
             .map(|(i, _)| i);

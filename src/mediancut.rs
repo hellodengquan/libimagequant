@@ -1,5 +1,5 @@
 use crate::hist::{HistItem, HistogramInternal};
-use crate::pal::{f_pixel, PalF, PalLen, PalPop, ARGBF};
+use crate::pal::{f_pixel, PalF, PalIndex, PalLen, PalPop, ARGBF};
 use crate::quant::quality_to_mse;
 use crate::{Error, OrdFloat, PushInCapacity};
 use core::cmp::Reverse;
@@ -263,7 +263,9 @@ impl<'hist> MedianCutter<'hist> {
     fn into_palette(mut self) -> PalF {
         let mut palette = PalF::new();
 
-        for (mbox, pal_index) in self.boxes.iter_mut().zip(0..) {
+        // u32 avoids overflow of the range when the palette has the maximum number of colors
+        for (pal_index, mbox) in (0u32..).zip(self.boxes.iter_mut()) {
+            let pal_index = pal_index as PalIndex;
             mbox.colors.iter_mut().for_each(move |a| a.set_likely_palette_index(pal_index));
 
             // store total color popularity (perceptual_weight is approximation of it)
